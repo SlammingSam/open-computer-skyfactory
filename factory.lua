@@ -63,6 +63,11 @@ local function defaultSettings()
     autoCraft = {
       enabled = false,     -- master switch for the whole feature
       checkSeconds = 15,   -- how often rules are evaluated against live stock
+      -- Ceiling on a single auto-craft request. A surplus rule can otherwise
+      -- compute a quantity far larger than an AE2 crafting CPU can plan or
+      -- hold, and AE2 simply cancels the job. Capped requests drain a large
+      -- surplus over successive firings instead. Tune to your CPU capacity.
+      maxBatch = 1000,
       rules = {},          -- {key, label, direction="below"|"above", threshold, craftQty, enabled}
     },
   }
@@ -432,17 +437,20 @@ local ui = {
   settingsTab = 1,      -- index into SETTINGS_TABS
   acSelected = 1,       -- selected row within the auto-craft rule list
   acTop = 1,            -- first visible row of that list
+  acEditBatch = false, acBatchText = "",   -- inline max-batch editor
 
-  -- Add-auto-craft-rule wizard, started from the dashboard with a craftable
-  -- item selected. Steps differ by direction:
-  --   below: direction -> threshold -> qty
-  --   above: direction -> threshold -> keep -> pickCraft -> ratio
-  -- "above" converts a surplus into a DIFFERENT item, so it needs both that
-  -- item and how many of the watched item one of them consumes.
-  acAdd = {
-    active = false, step = "direction", target = nil, direction = nil,
-    thresholdText = "", craftQtyText = "",
-    keepText = "", ratioText = "", craftTarget = nil,
+  -- Rule editor. One form serves both "add" and "edit": every field is on
+  -- screen at once and editable in any order, rather than a blind sequence of
+  -- prompts you can't review or revise. `index` is the rules[] slot being
+  -- edited, or nil when adding. `picking` holds which item field is currently
+  -- being chosen from the storage list.
+  form = {
+    active = false, index = nil, field = 1, picking = nil,
+    watchKey = nil, watchLabel = nil,
+    direction = "below",
+    triggerText = "", qtyText = "", keepText = "", ratioText = "",
+    craftKey = nil, craftLabel = nil,
+    enabled = true,
   },
 }
 
@@ -527,6 +535,12 @@ local function evaluateAutoCraft()
           end
         end
 
+        -- Cap the request. Without this a surplus rule asks for more than a
+        -- crafting CPU can plan and AE2 cancels the whole job, so nothing
+        -- drains at all; capped, each firing takes another bite.
+        local maxBatch = math.max(1, math.floor(tonumber(ac.maxBatch) or 1000))
+        if qty then qty = math.min(qty, maxBatch) end
+
         if entry and qty and qty >= 1 then
           -- Keyed by item AND direction: one item can carry both a restock
           -- and a surplus rule, and they must not share a cooldown slot.
@@ -557,6 +571,7 @@ end
 local KEY_ENTER, KEY_BACK, KEY_ESC = 28, 14, 1
 local KEY_UP, KEY_DOWN, KEY_PGUP, KEY_PGDN = 200, 208, 201, 209
 local KEY_HOME, KEY_END = 199, 207
+local KEY_LEFT, KEY_RIGHT = 203, 205
 
 -- Minecraft swallows Esc before the screen ever receives it (it closes the
 -- GUI), so cancel/back is bound to Delete. Esc is still honoured for setups
@@ -829,34 +844,16 @@ local function drawFooter()
     return
   end
 
-  if ui.acAdd.active then
-    local w = ui.acAdd
-    local name = w.target and w.target.label or "?"
-    local craftName = w.craftTarget and w.craftTarget.label or "?"
-
-    fg(C.craft); gset(2, H, "AUTO-CRAFT ")
+  -- The storage list doubles as the item picker for the rule editor, so it
+  -- says what it's picking for while that's happening.
+  if ui.form.picking then
+    fg(C.craft); gset(2, H, "PICK ")
     fg(C.selFg)
-
-    local prompt, hint
-    if w.step == "direction" then
-      prompt = name .. "  below(<) or above(>) threshold?"
-    elseif w.step == "threshold" then
-      local dirTxt = (w.direction == "below") and "<" or ">"
-      prompt = name .. "  trigger when " .. dirTxt .. " " .. w.thresholdText .. "_"
-    elseif w.step == "qty" then
-      prompt = name .. "  craft how many each time? " .. w.craftQtyText .. "_"
-    elseif w.step == "keep" then
-      prompt = name .. "  keep how many in stock? " .. w.keepText .. "_"
-    elseif w.step == "pickCraft" then
-      prompt = "surplus " .. name .. " -> pick the item to craft, then Enter"
-      hint = "j/k move · / filter · Enter pick · " .. CANCEL_HINT .. " cancel"
-    else -- ratio
-      prompt = name .. " consumed per " .. craftName .. ": " .. w.ratioText .. "_"
-    end
-
-    gset(13, H, prompt)
+    gset(8, H, ui.form.picking == "watch"
+      and "the item to WATCH, then Enter"
+      or  "the item to CRAFT, then Enter")
     fg(C.label)
-    hint = hint or ("Enter confirm · " .. CANCEL_HINT .. " cancel")
+    local hint = "j/k move · / filter · Enter pick · " .. CANCEL_HINT .. " cancel"
     gset(W - ulen(hint) - 1, H, hint)
     return
   end
@@ -940,6 +937,17 @@ local function drawAutoCraftTab()
   gset(13, 2, ac.enabled and "● ENABLED" or "● DISABLED")
   fg(C.label); gset(24, 2, "(E to toggle)")
 
+  -- Max batch is the difference between a surplus draining and AE2 refusing
+  -- the job outright, so it belongs on screen rather than in the settings file.
+  fg(C.label); gset(40, 2, "MAX BATCH")
+  fg(C.craft)
+  if ui.acEditBatch then
+    gset(50, 2, ui.acBatchText .. "_")
+  else
+    gset(50, 2, comma(ac.maxBatch or 1000))
+  end
+  fg(C.label); gset(64, 2, "(M to edit)")
+
   bg(C.bg); fg(C.border)
   gset(1, 4, "┌" .. string.rep("─", W - 2) .. "┐")
   gfill(1, 5, W, 1, " ")
@@ -1000,6 +1008,92 @@ local function drawAutoCraftTab()
   end
 end
 
+-- ============================== rule editor =================================
+-- Which fields exist depends on the rule type: a restock rule crafts the
+-- watched item itself, a surplus rule converts into a different one and so
+-- needs that item plus how much of the watched item it consumes.
+local function formFields()
+  if ui.form.direction == "below" then
+    return {"watch", "type", "trigger", "qty", "enabled"}
+  end
+  return {"watch", "type", "trigger", "keep", "craft", "ratio", "enabled"}
+end
+
+local FORM_LABELS = {
+  watch   = "Watch item",
+  type    = "Rule type",
+  trigger = "Trigger",
+  qty     = "Craft amount",
+  keep    = "Keep in stock",
+  craft   = "Craft this",
+  ratio   = "Consumed per craft",
+  enabled = "Enabled",
+}
+
+-- Numeric fields map to their text buffer; anything absent is not editable
+-- by typing digits.
+local FORM_NUMERIC = {
+  trigger = "triggerText", qty = "qtyText",
+  keep = "keepText", ratio = "ratioText",
+}
+
+local function formValue(id)
+  local f = ui.form
+  if id == "watch" then return f.watchLabel or "(none — press P to pick)" end
+  if id == "type" then
+    return f.direction == "below"
+      and "restock when low" or "convert surplus into another item"
+  end
+  if id == "trigger" then
+    return (f.direction == "below" and "when stock falls below  " or "when stock rises above  ")
+      .. (f.triggerText == "" and "—" or comma(f.triggerText))
+  end
+  if id == "qty" then return f.qtyText == "" and "—" or comma(f.qtyText) end
+  if id == "keep" then return f.keepText == "" and "—" or comma(f.keepText) end
+  if id == "craft" then return f.craftLabel or "(none — press P to pick)" end
+  if id == "ratio" then
+    return (f.ratioText == "" and "—" or f.ratioText)
+      .. "  " .. (f.watchLabel or "?") .. " per " .. (f.craftLabel or "?")
+  end
+  if id == "enabled" then return f.enabled and "yes" or "no" end
+  return ""
+end
+
+local function drawRuleForm()
+  local fields = formFields()
+  local title = ui.form.index and "EDIT RULE" or "NEW RULE"
+
+  bg(C.bg); fg(C.border)
+  local lead = "─ " .. title .. " "
+  gset(1, 4, "┌" .. lead .. string.rep("─", math.max(0, W - 2 - ulen(lead))) .. "┐")
+
+  local rows = #fields + 2
+  for r = 0, rows - 1 do
+    local y = 5 + r
+    gfill(2, y, W - 2, 1, " ")
+    fg(C.border); gset(1, y, "│"); gset(W, y, "│")
+  end
+  gset(1, 5 + rows, "└" .. string.rep("─", W - 2) .. "┘")
+
+  for i, id in ipairs(fields) do
+    local y = 6 + i - 1
+    local selected = (i == ui.form.field)
+
+    fg(selected and C.accent or C.border)
+    gset(4, y, selected and "▸" or " ")
+
+    fg(selected and C.selFg or C.label)
+    gset(6, y, fit(FORM_LABELS[id] or id, 20))
+
+    -- A numeric field being edited shows a caret so it's obvious that typing
+    -- digits goes here.
+    local value = formValue(id)
+    if selected and FORM_NUMERIC[id] then value = value .. "_" end
+    fg(selected and C.selFg or C.text)
+    gset(27, y, fit(value, math.max(4, W - 29)))
+  end
+end
+
 local function drawSettingsFooter()
   bg(C.bg); gfill(1, H, W, 1, " ")
 
@@ -1014,10 +1108,19 @@ local function drawSettingsFooter()
     return
   end
 
-  local hints = {
-    {"j/k", "move"}, {"Enter", "toggle rule"}, {"D", "delete"},
-    {"E", "toggle auto-craft"}, {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
-  }
+  local hints
+  if ui.form.active then
+    hints = {
+      {"j/k", "field"}, {"type", "number"}, {"←/→", "change"},
+      {"P", "pick item"}, {"Enter", "save"}, {CANCEL_HINT, "cancel"},
+    }
+  else
+    hints = {
+      {"j/k", "move"}, {"A", "add rule"}, {"Enter", "edit"}, {"Space", "on/off"},
+      {"D", "delete"}, {"E", "auto-craft"}, {"M", "max batch"},
+      {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
+    }
+  end
   local x = 2
   for _, h in ipairs(hints) do
     fg(C.accent); gset(x, H, h[1]); x = x + ulen(h[1]) + 1
@@ -1028,7 +1131,11 @@ end
 local function renderSettings()
   bg(C.bg); gfill(1, 1, W, H, " ")
   drawSettingsHeader()
-  drawAutoCraftTab()
+  if ui.form.active then
+    drawRuleForm()
+  else
+    drawAutoCraftTab()
+  end
   drawSettingsFooter()
 end
 
@@ -1126,89 +1233,8 @@ local function handleCraftKey(char, code)
   end
 end
 
-local function resetAutoCraftAdd()
-  ui.acAdd = {
-    active = false, step = "direction", target = nil, direction = nil,
-    thresholdText = "", craftQtyText = "",
-    keepText = "", ratioText = "", craftTarget = nil,
-  }
-end
-
--- Commits the wizard's collected answers as a rule and persists them.
-local function commitAutoCraftRule()
-  local w = ui.acAdd
-  local target = w.target
-  local threshold = tonumber(w.thresholdText)
-
-  if not target or not target.key then
-    setStatus("auto-craft rule cancelled: item has no stable identity", "bad")
-    return
-  end
-
-  local rule = {
-    key = target.key, label = target.label,
-    direction = w.direction, threshold = threshold, enabled = true,
-  }
-
-  if w.direction == "below" then
-    local qty = tonumber(w.craftQtyText)
-    if not qty or qty <= 0 then
-      setStatus("auto-craft rule cancelled: craft qty must be positive", "bad")
-      return
-    end
-    -- A restock rule crafts the watched item itself, so THIS is where
-    -- craftability actually has to hold.
-    if not target.craftEntry then
-      setStatus("auto-craft rule cancelled: '" .. target.label
-                .. "' is not craftable in this network", "bad")
-      return
-    end
-    rule.craftQty = qty
-  else
-    local keep  = tonumber(w.keepText)
-    local ratio = tonumber(w.ratioText)
-    local craft = w.craftTarget
-    if not keep or keep < 0 then
-      setStatus("auto-craft rule cancelled: keep amount must be 0 or more", "bad")
-      return
-    end
-    if keep >= threshold then
-      setStatus("auto-craft rule cancelled: keep must be below the trigger", "bad")
-      return
-    end
-    if not ratio or ratio < 1 then
-      setStatus("auto-craft rule cancelled: ratio must be 1 or more", "bad")
-      return
-    end
-    if not craft or not craft.key or not craft.craftEntry then
-      setStatus("auto-craft rule cancelled: craft target is not craftable", "bad")
-      return
-    end
-    rule.keep, rule.ratio = keep, math.floor(ratio)
-    rule.craftKey, rule.craftLabel = craft.key, craft.label
-  end
-
-  -- Replace an existing rule only when the watched item AND direction both
-  -- match, so one item can carry both a restock ("below") and a surplus
-  -- conversion ("above") rule without either clobbering the other.
-  local rules = settings.autoCraft.rules
-  for i = #rules, 1, -1 do
-    if rules[i].key == target.key and rules[i].direction == w.direction then
-      table.remove(rules, i)
-    end
-  end
-  rules[#rules + 1] = rule
-
-  local ok, err = saveSettings(settings)
-  setStatus(
-    ok and ("auto-craft rule saved: " .. target.label)
-        or ("rule added but NOT saved to disk: " .. tostring(err)),
-    ok and "good" or "bad"
-  )
-end
-
--- Reads a digit/backspace into `field`, returning the updated text. Shared by
--- every numeric step so they can't drift apart.
+-- Reads a digit/backspace into a text buffer. Shared by every numeric input
+-- so they can't drift apart.
 local function editNumber(text, char, code, maxLen)
   if code == KEY_BACK then return text:sub(1, -2) end
   if char and char >= 48 and char <= 57 and #text < maxLen then
@@ -1217,93 +1243,219 @@ local function editNumber(text, char, code, maxLen)
   return text
 end
 
--- The pickCraft step drives the storage list directly (move/filter/pick)
--- rather than deferring to the dashboard handler, so keys like a/o/c can't
--- restart or navigate away from a half-built rule.
-local function handleAutoCraftAddKey(char, code)
-  local w = ui.acAdd
+-- ============================== rule editor =================================
+
+local function closeRuleForm()
+  ui.form = {
+    active = false, index = nil, field = 1, picking = nil,
+    watchKey = nil, watchLabel = nil,
+    direction = "below",
+    triggerText = "", qtyText = "", keepText = "", ratioText = "",
+    craftKey = nil, craftLabel = nil,
+    enabled = true,
+  }
+end
+
+-- Opens the editor. `rule` nil = adding; `item` optionally pre-fills the
+-- watched item (the dashboard's A shortcut passes the highlighted row).
+local function openRuleForm(rule, index, item)
+  closeRuleForm()
+  local f = ui.form
+  f.active, f.index, f.field = true, index, 1
+
+  if rule then
+    f.watchKey, f.watchLabel = rule.key, rule.label
+    f.direction = rule.direction or "below"
+    f.triggerText = tostring(rule.threshold or "")
+    f.qtyText  = rule.craftQty and tostring(rule.craftQty) or ""
+    f.keepText = rule.keep and tostring(rule.keep) or ""
+    f.ratioText = rule.ratio and tostring(rule.ratio) or ""
+    f.craftKey, f.craftLabel = rule.craftKey, rule.craftLabel
+    f.enabled = rule.enabled ~= false
+  elseif item then
+    f.watchKey, f.watchLabel = item.key, item.label
+  end
+end
+
+-- Validates the form and writes it into settings. Returns false (with a
+-- status message already set) when something is missing, so the editor can
+-- stay open on the offending field rather than discarding the user's work.
+local function saveRuleForm()
+  local f = ui.form
+  local trigger = tonumber(f.triggerText)
+
+  if not f.watchKey then
+    setStatus("pick an item to watch (P on the Watch item field)", "bad")
+    return false
+  end
+  if not trigger or trigger < 0 then
+    setStatus("trigger must be a non-negative number", "bad")
+    return false
+  end
+
+  local rule = {
+    key = f.watchKey, label = f.watchLabel,
+    direction = f.direction, threshold = trigger, enabled = f.enabled,
+  }
+
+  if f.direction == "below" then
+    local qty = tonumber(f.qtyText)
+    if not qty or qty <= 0 then
+      setStatus("craft amount must be a positive number", "bad")
+      return false
+    end
+    -- A restock rule crafts the watched item itself, so craftability has to
+    -- hold for THAT item.
+    local watched = findItemByKey(f.watchKey)
+    if not watched or not watched.craftEntry then
+      setStatus("'" .. tostring(f.watchLabel) .. "' is not craftable in this network", "bad")
+      return false
+    end
+    rule.craftQty = qty
+  else
+    local keep, ratio = tonumber(f.keepText), tonumber(f.ratioText)
+    if not keep or keep < 0 then
+      setStatus("keep amount must be 0 or more", "bad")
+      return false
+    end
+    if keep >= trigger then
+      setStatus("keep must be below the trigger, or the rule can never drain", "bad")
+      return false
+    end
+    if not ratio or ratio < 1 then
+      setStatus("consumed-per-craft must be 1 or more", "bad")
+      return false
+    end
+    if not f.craftKey then
+      setStatus("pick an item to craft (P on the Craft this field)", "bad")
+      return false
+    end
+    local target = findItemByKey(f.craftKey)
+    if not target or not target.craftEntry then
+      setStatus("'" .. tostring(f.craftLabel) .. "' is not craftable in this network", "bad")
+      return false
+    end
+    rule.keep, rule.ratio = keep, math.floor(ratio)
+    rule.craftKey, rule.craftLabel = f.craftKey, f.craftLabel
+  end
+
+  local rules = settings.autoCraft.rules
+  if f.index then
+    rules[f.index] = rule
+  else
+    -- Replace an existing rule only when the watched item AND direction both
+    -- match, so one item can carry both a restock and a surplus rule without
+    -- either clobbering the other.
+    for i = #rules, 1, -1 do
+      if rules[i].key == rule.key and rules[i].direction == rule.direction then
+        table.remove(rules, i)
+      end
+    end
+    rules[#rules + 1] = rule
+  end
+
+  local ok, err = saveSettings(settings)
+  setStatus(
+    ok and ("rule saved: " .. tostring(rule.label))
+        or ("rule saved in memory but NOT to disk: " .. tostring(err)),
+    ok and "good" or "bad"
+  )
+  return true
+end
+
+-- The storage list doubles as the item picker, so while picking it drives the
+-- list directly rather than deferring to the dashboard handler — otherwise
+-- keys like a/o/c could navigate away from a half-built rule.
+local function handlePickerKey(char, code)
+  local f = ui.form
+  local list = filteredItems()
 
   if isCancel(code) then
-    resetAutoCraftAdd()
-    setStatus("auto-craft rule cancelled", "info")
+    f.picking = nil
+    ui.page = "settings"
     return
   end
 
-  if w.step == "direction" then
-    if char == string.byte("<") then
-      w.direction, w.step = "below", "threshold"
-    elseif char == string.byte(">") then
-      w.direction, w.step = "above", "threshold"
-    end
-    return
-  end
-
-  if w.step == "threshold" then
-    if code == KEY_ENTER then
-      local n = tonumber(w.thresholdText)
-      if not n or n < 0 then
-        setStatus("trigger must be a non-negative number", "bad")
-      else
-        w.step = (w.direction == "below") and "qty" or "keep"
-      end
-    else
-      w.thresholdText = editNumber(w.thresholdText, char, code, 9)
-    end
-    return
-  end
-
-  if w.step == "qty" then                       -- below only
-    if code == KEY_ENTER then
-      commitAutoCraftRule()
-      resetAutoCraftAdd()
-    else
-      w.craftQtyText = editNumber(w.craftQtyText, char, code, 7)
-    end
-    return
-  end
-
-  if w.step == "keep" then                      -- above only
-    if code == KEY_ENTER then
-      local n = tonumber(w.keepText)
-      if not n or n < 0 then
-        setStatus("keep amount must be 0 or more", "bad")
-      else
-        w.step = "pickCraft"
-      end
-    else
-      w.keepText = editNumber(w.keepText, char, code, 9)
-    end
-    return
-  end
-
-  if w.step == "pickCraft" then                 -- above only
-    local list = filteredItems()
-    if code == KEY_ENTER then
-      local it = list[ui.selected]
-      if not it then
-        setStatus("nothing selected", "bad")
-      elseif not it.craftEntry then
-        setStatus("'" .. it.label .. "' is not craftable in this network", "bad")
-      elseif not it.key then
-        setStatus("'" .. it.label .. "' has no stable identity", "bad")
-      else
-        w.craftTarget, w.step = it, "ratio"
-      end
-    elseif char == string.byte("/") then
-      ui.filterMode, ui.filterText = true, ""
-      invalidateView()
-    else
-      moveSelection((char and char > 0) and string.char(char):lower() or "", code, list)
-    end
-    return
-  end
-
-  -- ratio (above only)
   if code == KEY_ENTER then
-    commitAutoCraftRule()
-    resetAutoCraftAdd()
-  else
-    w.ratioText = editNumber(w.ratioText, char, code, 4)
+    local it = list[ui.selected]
+    if not it then
+      setStatus("nothing selected", "bad")
+    elseif not it.key then
+      setStatus("'" .. it.label .. "' has no stable identity for a rule", "bad")
+    elseif f.picking == "craft" and not it.craftEntry then
+      setStatus("'" .. it.label .. "' is not craftable in this network", "bad")
+    else
+      if f.picking == "watch" then
+        f.watchKey, f.watchLabel = it.key, it.label
+      else
+        f.craftKey, f.craftLabel = it.key, it.label
+      end
+      f.picking = nil
+      ui.page = "settings"
+    end
+    return
+  end
+
+  if char == string.byte("/") then
+    ui.filterMode, ui.filterText = true, ""
+    invalidateView()
+    return
+  end
+
+  moveSelection((char and char > 0) and string.char(char):lower() or "", code, list)
+end
+
+local function handleRuleFormKey(char, code)
+  local f = ui.form
+  local ch = (char and char > 0) and string.char(char):lower() or ""
+  local fields = formFields()
+  local id = fields[math.max(1, math.min(#fields, f.field))]
+
+  if isCancel(code) then
+    closeRuleForm()
+    setStatus("rule editing cancelled", "info")
+    return
+  end
+
+  if code == KEY_ENTER then
+    if saveRuleForm() then closeRuleForm() end
+    return
+  end
+
+  if ch == "j" or code == KEY_DOWN then
+    f.field = math.min(#fields, f.field + 1)
+    return
+  end
+  if ch == "k" or code == KEY_UP then
+    f.field = math.max(1, f.field - 1)
+    return
+  end
+
+  -- Choice fields flip with the arrows; item fields open the picker.
+  if code == KEY_LEFT or code == KEY_RIGHT then
+    if id == "type" then
+      f.direction = (f.direction == "below") and "above" or "below"
+      f.field = math.min(f.field, #formFields())   -- field set just changed
+    elseif id == "enabled" then
+      f.enabled = not f.enabled
+    end
+    return
+  end
+
+  if ch == "p" then
+    if id == "watch" or id == "craft" then
+      f.picking = id
+      ui.page = "dashboard"      -- the storage list lives on the dashboard
+      ui.selected = 1
+    else
+      setStatus("P picks an item — move to the Watch or Craft field first", "info")
+    end
+    return
+  end
+
+  local buffer = FORM_NUMERIC[id]
+  if buffer then
+    f[buffer] = editNumber(f[buffer], char, code, 9)
   end
 end
 
@@ -1313,6 +1465,36 @@ local function handleSettingsKey(char, code)
   -- Cleared per keypress like the dashboard does, so a message from the last
   -- action doesn't sit pinned to the footer while you scroll the list.
   ui.status = nil
+
+  -- Inline max-batch editor takes the keyboard while open.
+  if ui.acEditBatch then
+    if isCancel(code) then
+      ui.acEditBatch, ui.acBatchText = false, ""
+    elseif code == KEY_ENTER then
+      local n = tonumber(ui.acBatchText)
+      if not n or n < 1 then
+        setStatus("max batch must be 1 or more", "bad")
+      else
+        settings.autoCraft.maxBatch = math.floor(n)
+        local ok, err = saveSettings(settings)
+        setStatus(
+          ok and ("max batch set to " .. comma(math.floor(n)))
+              or ("changed but NOT saved to disk: " .. tostring(err)),
+          ok and "good" or "bad"
+        )
+        ui.acEditBatch, ui.acBatchText = false, ""
+      end
+    else
+      ui.acBatchText = editNumber(ui.acBatchText, char, code, 7)
+    end
+    return
+  end
+
+  if ch == "m" then
+    ui.acEditBatch = true
+    ui.acBatchText = tostring(settings.autoCraft.maxBatch or 1000)
+    return
+  end
 
   if ch == "q" then
     return "quit"
@@ -1330,6 +1512,8 @@ local function handleSettingsKey(char, code)
         .. (settings.autoCraft.enabled and "enabled" or "disabled"),
       ok and "good" or "bad"
     )
+  elseif ch == "a" then
+    openRuleForm(nil, nil, nil)
   elseif ch == "d" then
     local rule = rules[ui.acSelected]
     if rule then
@@ -1342,6 +1526,9 @@ local function handleSettingsKey(char, code)
       )
     end
   elseif code == KEY_ENTER then
+    local rule = rules[ui.acSelected]
+    if rule then openRuleForm(rule, ui.acSelected, nil) end
+  elseif char == 32 then                          -- Space toggles on/off
     local rule = rules[ui.acSelected]
     if rule then
       rule.enabled = not rule.enabled
@@ -1358,7 +1545,10 @@ end
 local function handleKey(char, code)
   if ui.filterMode then return handleFilterKey(char, code) end
   if ui.craftMode  then return handleCraftKey(char, code) end
-  if ui.acAdd.active then return handleAutoCraftAddKey(char, code) end
+  -- The picker borrows the dashboard's list, so it is checked before the
+  -- page dispatch; the form itself lives on the settings page.
+  if ui.form.picking then return handlePickerKey(char, code) end
+  if ui.form.active then return handleRuleFormKey(char, code) end
   if ui.page == "settings" then return handleSettingsKey(char, code) end
 
   local ch = (char and char > 0) and string.char(char):lower() or ""
@@ -1413,10 +1603,10 @@ local function handleKey(char, code)
     elseif not it.key then
       setStatus("'" .. it.label .. "' has no stable identity for a rule", "bad")
     else
-      -- Reset first so the wizard always starts from the full current shape;
-      -- spelling the fields out here is how they drift when the shape changes.
-      resetAutoCraftAdd()
-      ui.acAdd.active, ui.acAdd.target = true, it
+      -- Shortcut: jump straight into the rule editor on the settings page
+      -- with this item already filled in as the one to watch.
+      openRuleForm(nil, nil, it)
+      ui.page = "settings"
     end
   end
 end
