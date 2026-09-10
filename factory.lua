@@ -46,6 +46,70 @@ local function cleanLabel(label)
   return (label:gsub("%$[0-9a-fk-or]", ""))
 end
 
+-- ============================ settings persistence ==========================
+-- Settings live in a single serialized file so they survive reboots/updates.
+-- mergeDefaults() fills in any settings key a future version adds without
+-- disturbing what is already saved — the schema can grow later without ever
+-- invalidating an existing settings file.
+
+local serialization; pcall(function() serialization = require("serialization") end)
+
+local SETTINGS_PATH = "/home/.factory_settings.cfg"
+local SETTINGS_VERSION = 1
+
+local function defaultSettings()
+  return {
+    version = SETTINGS_VERSION,
+    autoCraft = {
+      enabled = false,     -- master switch for the whole feature
+      checkSeconds = 15,   -- how often rules are evaluated against live stock
+      rules = {},          -- {key, label, direction="below"|"above", threshold, craftQty, enabled}
+    },
+  }
+end
+
+-- Recursively fills in any key present in `defaults` but missing from
+-- `loaded`, without touching anything already set. Safe to call on tables
+-- that also hold array data (e.g. `rules`): defaults for those are always
+-- empty, so there is nothing to merge into an existing array.
+local function mergeDefaults(loaded, defaults)
+  if type(loaded) ~= "table" then return defaults end
+  for k, v in pairs(defaults) do
+    if loaded[k] == nil then
+      loaded[k] = v
+    elseif type(v) == "table" and type(loaded[k]) == "table" then
+      mergeDefaults(loaded[k], v)
+    end
+  end
+  return loaded
+end
+
+local function loadSettings()
+  if not serialization then return defaultSettings() end
+  local f = io.open(SETTINGS_PATH, "r")
+  if not f then return defaultSettings() end
+  local raw = f:read("*a")
+  f:close()
+
+  local ok, loaded = pcall(serialization.unserialize, raw)
+  if not ok or type(loaded) ~= "table" then return defaultSettings() end
+  return mergeDefaults(loaded, defaultSettings())
+end
+
+local function saveSettings(s)
+  if not serialization then return false, "serialization API not available" end
+  local ok, serialized = pcall(serialization.serialize, s)
+  if not ok then return false, tostring(serialized) end
+
+  local f, err = io.open(SETTINGS_PATH, "w")
+  if not f then return false, tostring(err) end
+  f:write(serialized)
+  f:close()
+  return true
+end
+
+local settings = loadSettings()
+
 -- ================================= palette ==================================
 
 local C = {
@@ -134,7 +198,7 @@ local viewCache, viewDirty = {}, true
 local function invalidateView() viewDirty = true end
 
 local state = {
-  items = {},        -- {label, count, craftEntry}
+  items = {},        -- {label, count, craftEntry, key}
   power = 0, maxPower = 0,
   cpus = {}, cpuBusy = 0,
   craftSet = {},     -- "name#damage" -> {entry = ..., label = ...}
@@ -143,6 +207,8 @@ local state = {
   lastOk = false,
   craftLoadedAt = nil,
   jobs = {},         -- live craft jobs: {label, qty, obj, startedAt, status}
+  autoCraftLastFired = {},  -- rule.key -> computer.uptime() of last trigger (not persisted)
+  autoCraftCheckedAt = nil,
 }
 
 -- Identity key for a stack. In 1.12.2 `damage` is the variant discriminator
@@ -214,6 +280,7 @@ local function refresh()
       label = cleanLabel(it.label or it.name or "?"),
       count = tonumber(it.size or it.count) or 0,
       craftEntry = craft and craft.entry or nil,
+      key = key,
     }
     if key then seen[key] = true end
   end
@@ -222,7 +289,7 @@ local function refresh()
   -- something you have zero of — otherwise they'd be invisible and unorderable.
   for key, c in pairs(state.craftSet) do
     if not seen[key] then
-      items[#items + 1] = {label = c.label, count = 0, craftEntry = c.entry}
+      items[#items + 1] = {label = c.label, count = 0, craftEntry = c.entry, key = key}
     end
   end
 
@@ -317,6 +384,19 @@ local function requestCraft(entry, qty, label)
   return true, job
 end
 
+-- Whether `label` already has a live (not yet resolved) job in flight, so
+-- auto-craft doesn't pile up duplicate requests for the same item while one
+-- is still being planned/executed.
+local function hasActiveJobFor(label)
+  for _, job in ipairs(state.jobs) do
+    if job.label == label and job.status ~= "done"
+       and job.status ~= "canceled" and job.status ~= "unreadable" then
+      return true
+    end
+  end
+  return false
+end
+
 -- ================================ UI state ==================================
 
 -- Sort modes, cycled with `s`. Every comparator falls back to name so the
@@ -347,7 +427,20 @@ local ui = {
   craftMode = false, craftQty = "", craftTarget = nil,
   status = nil, statusKind = "info",   -- info | good | bad
   sort = 1,
+
+  page = "dashboard",   -- "dashboard" | "settings"
+  settingsTab = 1,      -- index into SETTINGS_TABS
+  acSelected = 1,       -- selected row within the auto-craft rule list
+
+  -- Add-auto-craft-rule wizard, started from the dashboard with a craftable
+  -- item selected; step 1 picks direction, 2 the threshold, 3 the craft qty.
+  acAdd = {
+    active = false, step = 1, target = nil,
+    direction = nil, thresholdText = "", craftQtyText = "",
+  },
 }
+
+local SETTINGS_TABS = {"Auto-Craft"}  -- more tabs can be appended here later
 
 local function setStatus(msg, kind)
   ui.status = msg
@@ -372,6 +465,53 @@ local function filteredItems()
   table.sort(out, SORTS[ui.sort].cmp)
   viewCache, viewDirty = out, false
   return viewCache
+end
+
+-- Evaluates every enabled auto-craft rule against live stock and fires
+-- requestCraft() for any that cross their threshold. Runs on its own
+-- (settings-configurable) interval regardless of how often this is called,
+-- and a per-rule cooldown plus hasActiveJobFor() keep a persistently-crossed
+-- threshold from resubmitting the same request every tick.
+local AUTO_CRAFT_COOLDOWN_SECONDS = 60
+
+local function evaluateAutoCraft()
+  local ac = settings.autoCraft
+  if not ac.enabled then return end
+
+  local interval = tonumber(ac.checkSeconds) or 15
+  if state.autoCraftCheckedAt and computer.uptime() - state.autoCraftCheckedAt < interval then
+    return
+  end
+  state.autoCraftCheckedAt = computer.uptime()
+
+  for _, rule in ipairs(ac.rules) do
+    if rule.enabled then
+      local current
+      for _, it in ipairs(state.items) do
+        if it.key == rule.key then current = it; break end
+      end
+
+      if current and current.craftEntry then
+        local triggered =
+          (rule.direction == "below" and current.count < rule.threshold)
+          or (rule.direction == "above" and current.count > rule.threshold)
+
+        if triggered then
+          local last = state.autoCraftLastFired[rule.key]
+          local cooled = (not last) or (computer.uptime() - last >= AUTO_CRAFT_COOLDOWN_SECONDS)
+          if cooled and not hasActiveJobFor(rule.label) then
+            local ok, result = requestCraft(current.craftEntry, rule.craftQty, rule.label)
+            state.autoCraftLastFired[rule.key] = computer.uptime()
+            setStatus(
+              ok and ("auto-craft: " .. rule.label .. " x" .. comma(rule.craftQty))
+                  or ("auto-craft failed: " .. rule.label .. " - " .. tostring(result)),
+              ok and "info" or "bad"
+            )
+          end
+        end
+      end
+    end
+  end
 end
 
 -- ================================ rendering =================================
@@ -636,6 +776,23 @@ local function drawFooter()
     return
   end
 
+  if ui.acAdd.active then
+    local name = ui.acAdd.target and ui.acAdd.target.label or "?"
+    fg(C.craft); gset(2, H, "AUTO-CRAFT ")
+    if ui.acAdd.step == 1 then
+      fg(C.selFg); gset(13, H, name .. "  below(<) or above(>) threshold?")
+    elseif ui.acAdd.step == 2 then
+      local dirTxt = ui.acAdd.direction == "below" and "<" or ">"
+      fg(C.selFg); gset(13, H, name .. "  " .. dirTxt .. " " .. ui.acAdd.thresholdText .. "_")
+    else
+      fg(C.selFg); gset(13, H, name .. "  craft qty: " .. ui.acAdd.craftQtyText .. "_")
+    end
+    fg(C.label)
+    local hint = "Enter confirm · Esc cancel"
+    gset(W - ulen(hint) - 1, H, hint)
+    return
+  end
+
   if ui.status then
     fg((ui.statusKind == "bad" and C.bad)
        or (ui.statusKind == "good" and C.good)
@@ -652,7 +809,7 @@ local function drawFooter()
   -- Keybinding hints: keys in accent, descriptions dim.
   local hints = {
     {"R", "refresh"}, {"j/k", "move"}, {"/", "filter"}, {"S", "sort"},
-    {"C", "craft"}, {"Esc", "clear"}, {"Q", "quit"},
+    {"C", "craft"}, {"A", "auto-craft"}, {"O", "settings"}, {"Esc", "clear"}, {"Q", "quit"},
   }
   local x = 2
   for _, h in ipairs(hints) do
@@ -661,7 +818,115 @@ local function drawFooter()
   end
 end
 
+-- =============================== settings page ===============================
+
+local function drawSettingsHeader()
+  bg(C.headerBg); gfill(1, 1, W, 1, " ")
+  fg(C.headerFg); gset(2, 1, "◆ SETTINGS")
+
+  -- Tab bar, right-aligned; only one tab exists today, but the bar already
+  -- supports cycling through more as they're added.
+  local x = W - 2
+  for i = #SETTINGS_TABS, 1, -1 do
+    local label = " " .. SETTINGS_TABS[i] .. " "
+    x = x - ulen(label)
+    fg(i == ui.settingsTab and C.selFg or C.label)
+    bg(i == ui.settingsTab and C.selBg or C.headerBg)
+    gset(x, 1, label)
+    x = x - 1
+  end
+  bg(C.headerBg)
+end
+
+local function drawAutoCraftTab()
+  local ac = settings.autoCraft
+
+  bg(C.bg); gfill(1, 2, W, 1, " ")
+  fg(C.label); gset(2, 2, "AUTO-CRAFT")
+  fg(ac.enabled and C.good or C.bad)
+  gset(13, 2, ac.enabled and "● ENABLED" or "● DISABLED")
+  fg(C.label); gset(24, 2, "(E to toggle)")
+
+  bg(C.bg); fg(C.border)
+  gset(1, 4, "┌" .. string.rep("─", W - 2) .. "┐")
+  gfill(1, 5, W, 1, " ")
+  gset(1, 5, "│"); gset(W, 5, "│")
+  fg(C.label)
+  gset(3, 5, fit("ITEM", 30))
+  gset(34, 5, fit("WHEN", 14))
+  gset(49, 5, ralign("CRAFT", 10))
+  gset(61, 5, "STATE")
+  fg(C.border)
+  gset(1, 6, "├" .. string.rep("─", W - 2) .. "┤")
+
+  local rows = math.max(1, H - 9)
+  local rules = ac.rules
+  if ui.acSelected > #rules then ui.acSelected = math.max(1, #rules) end
+  if ui.acSelected < 1 then ui.acSelected = 1 end
+
+  for r = 0, rows - 1 do
+    local y = 7 + r
+    local idx = r + 1
+    local rule = rules[idx]
+    local selected = (idx == ui.acSelected)
+    local rowBg = selected and C.selBg or C.bg
+
+    bg(rowBg); gfill(2, y, W - 2, 1, " ")
+    fg(C.border); bg(C.bg); gset(1, y, "│"); gset(W, y, "│")
+
+    if rule then
+      bg(rowBg)
+      fg(selected and C.accent or C.border)
+      gset(3, y, selected and "▸ " or "  ")
+      fg(selected and C.selFg or C.text)
+      gset(5, y, fit(rule.label, 28))
+      fg(C.label)
+      gset(34, y, fit((rule.direction == "below" and "< " or "> ") .. comma(rule.threshold), 14))
+      fg(C.craft)
+      gset(49, y, ralign(comma(rule.craftQty), 10))
+      fg(rule.enabled and C.good or C.zero)
+      gset(61, y, rule.enabled and "on" or "off")
+    end
+  end
+
+  bg(C.bg); fg(C.border)
+  gset(1, 7 + rows, "└" .. string.rep("─", W - 2) .. "┘")
+
+  if #rules == 0 then
+    fg(C.zero)
+    local msg = "no rules yet - select a craftable item on the dashboard and press A"
+    gset(math.max(1, math.floor((W - ulen(msg)) / 2)), 9, msg)
+  end
+end
+
+local function drawSettingsFooter()
+  bg(C.bg); gfill(1, H, W, 1, " ")
+  local hints = {
+    {"j/k", "move"}, {"Enter", "toggle rule"}, {"D", "delete"},
+    {"E", "toggle auto-craft"}, {"O/Esc", "back"}, {"Q", "quit"},
+  }
+  local x = 2
+  for _, h in ipairs(hints) do
+    fg(C.accent); gset(x, H, h[1]); x = x + ulen(h[1]) + 1
+    fg(C.label);  gset(x, H, h[2]); x = x + ulen(h[2]) + 3
+  end
+end
+
+local function renderSettings()
+  bg(C.bg); gfill(1, 1, W, H, " ")
+  drawSettingsHeader()
+  drawAutoCraftTab()
+  drawSettingsFooter()
+end
+
+-- ================================= render ====================================
+
 local function render()
+  if ui.page == "settings" then
+    renderSettings()
+    return
+  end
+
   bg(C.bg); gfill(1, 1, W, H, " ")
   drawHeader()
   drawPower()
@@ -734,9 +999,129 @@ local function handleCraftKey(char, code)
   end
 end
 
+local function resetAutoCraftAdd()
+  ui.acAdd = {active = false, step = 1, target = nil, direction = nil, thresholdText = "", craftQtyText = ""}
+end
+
+local function handleAutoCraftAddKey(char, code)
+  local w = ui.acAdd
+  if code == KEY_ESC then
+    resetAutoCraftAdd()
+    setStatus("auto-craft rule cancelled", "info")
+    return
+  end
+
+  if w.step == 1 then
+    if char == string.byte("<") then
+      w.direction, w.step = "below", 2
+    elseif char == string.byte(">") then
+      w.direction, w.step = "above", 2
+    end
+    return
+  end
+
+  if w.step == 2 then
+    if code == KEY_BACK then
+      w.thresholdText = w.thresholdText:sub(1, -2)
+    elseif char and char >= 48 and char <= 57 then
+      if #w.thresholdText < 9 then w.thresholdText = w.thresholdText .. string.char(char) end
+    elseif code == KEY_ENTER then
+      local n = tonumber(w.thresholdText)
+      if not n or n < 0 then
+        setStatus("threshold must be a non-negative number", "bad")
+      else
+        w.step = 3
+      end
+    end
+    return
+  end
+
+  -- step 3: craft quantity
+  if code == KEY_BACK then
+    w.craftQtyText = w.craftQtyText:sub(1, -2)
+  elseif char and char >= 48 and char <= 57 then
+    if #w.craftQtyText < 7 then w.craftQtyText = w.craftQtyText .. string.char(char) end
+  elseif code == KEY_ENTER then
+    local qty = tonumber(w.craftQtyText)
+    local threshold = tonumber(w.thresholdText)
+    local target = w.target
+
+    if not qty or qty <= 0 then
+      setStatus("auto-craft rule cancelled: craft qty must be positive", "bad")
+    elseif not target or not target.key then
+      setStatus("auto-craft rule cancelled: item has no stable identity", "bad")
+    else
+      -- Replace any existing rule for the same item rather than duplicating.
+      local rules = settings.autoCraft.rules
+      for i = #rules, 1, -1 do
+        if rules[i].key == target.key then table.remove(rules, i) end
+      end
+      rules[#rules + 1] = {
+        key = target.key, label = target.label,
+        direction = w.direction, threshold = threshold,
+        craftQty = qty, enabled = true,
+      }
+      local ok, err = saveSettings(settings)
+      setStatus(
+        ok and ("auto-craft rule saved: " .. target.label)
+            or ("rule added but NOT saved to disk: " .. tostring(err)),
+        ok and "good" or "bad"
+      )
+    end
+    resetAutoCraftAdd()
+  end
+end
+
+local function handleSettingsKey(char, code)
+  local ch = (char and char > 0) and string.char(char):lower() or ""
+  local rules = settings.autoCraft.rules
+
+  if ch == "q" then
+    return "quit"
+  elseif ch == "o" or code == KEY_ESC then
+    ui.page = "dashboard"
+  elseif ch == "j" or code == KEY_DOWN then
+    ui.acSelected = math.min(#rules, ui.acSelected + 1)
+  elseif ch == "k" or code == KEY_UP then
+    ui.acSelected = math.max(1, ui.acSelected - 1)
+  elseif ch == "e" then
+    settings.autoCraft.enabled = not settings.autoCraft.enabled
+    local ok, err = saveSettings(settings)
+    setStatus(
+      (ok and "auto-craft " or ("auto-craft (NOT SAVED: " .. tostring(err) .. ") "))
+        .. (settings.autoCraft.enabled and "enabled" or "disabled"),
+      ok and "good" or "bad"
+    )
+  elseif ch == "d" then
+    local rule = rules[ui.acSelected]
+    if rule then
+      table.remove(rules, ui.acSelected)
+      local ok, err = saveSettings(settings)
+      setStatus(
+        ok and ("rule removed: " .. rule.label)
+            or ("removed but NOT saved to disk: " .. tostring(err)),
+        ok and "info" or "bad"
+      )
+    end
+  elseif code == KEY_ENTER then
+    local rule = rules[ui.acSelected]
+    if rule then
+      rule.enabled = not rule.enabled
+      local ok, err = saveSettings(settings)
+      setStatus(
+        ok and (rule.label .. (rule.enabled and " enabled" or " disabled"))
+            or ("toggled but NOT saved to disk: " .. tostring(err)),
+        ok and "info" or "bad"
+      )
+    end
+  end
+end
+
 local function handleKey(char, code)
   if ui.filterMode then return handleFilterKey(char, code) end
   if ui.craftMode  then return handleCraftKey(char, code) end
+  if ui.acAdd.active then return handleAutoCraftAddKey(char, code) end
+  if ui.page == "settings" then return handleSettingsKey(char, code) end
 
   local ch = (char and char > 0) and string.char(char):lower() or ""
   local list = filteredItems()
@@ -744,6 +1129,9 @@ local function handleKey(char, code)
 
   if ch == "q" then
     return "quit"
+  elseif ch == "o" then
+    ui.page = "settings"
+    ui.acSelected = 1
   elseif ch == "r" then
     -- A manual refresh is deliberate, so rebuild the craftable catalogue too;
     -- that is how a newly-added recipe shows up without restarting.
@@ -784,6 +1172,17 @@ local function handleKey(char, code)
       setStatus("'" .. it.label .. "' is not craftable in this network", "bad")
     else
       ui.craftMode, ui.craftQty, ui.craftTarget = true, "", it
+    end
+  elseif ch == "a" then
+    local it = list[ui.selected]
+    if not it then
+      setStatus("nothing selected", "bad")
+    elseif not it.craftEntry then
+      setStatus("'" .. it.label .. "' is not craftable in this network", "bad")
+    elseif not it.key then
+      setStatus("'" .. it.label .. "' has no stable identity for a rule", "bad")
+    else
+      ui.acAdd = {active = true, step = 1, target = it, direction = nil, thresholdText = "", craftQtyText = ""}
     end
   end
 end
@@ -842,6 +1241,10 @@ local function main()
     -- Cheap (a call or two per live job) and needs to be responsive, so it
     -- runs every iteration rather than only on the 3s tick.
     pollJobs()
+    -- evaluateAutoCraft() no-ops until its own checkSeconds interval has
+    -- elapsed, so calling it every iteration just makes it responsive to
+    -- that interval rather than tied to the dashboard's own refresh timing.
+    evaluateAutoCraft()
     render()
   end
 
