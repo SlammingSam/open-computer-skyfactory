@@ -127,15 +127,66 @@ end
 
 -- =============================== data layer =================================
 
+-- The view (filter + sort) is rebuilt only when something that affects it
+-- changes, rather than on every render and every keypress. Declared here so
+-- refresh() can invalidate it.
+local viewCache, viewDirty = {}, true
+local function invalidateView() viewDirty = true end
+
 local state = {
-  items = {},        -- sorted {label, count, craftable}
+  items = {},        -- {label, count, craftEntry}
   power = 0, maxPower = 0,
   cpus = {}, cpuBusy = 0,
-  craftSet = {},     -- cleaned label -> craftable entry
+  craftSet = {},     -- "name#damage" -> {entry = ..., label = ...}
   craftableCount = 0,
   err = nil,
   lastOk = false,
+  craftLoadedAt = nil,
 }
+
+-- Identity key for a stack. In 1.12.2 `damage` is the variant discriminator
+-- (plank woods, wool colours), so name alone would collide across variants.
+-- Falls back to the cleaned label when the bridge gives no name.
+local function stackKey(t)
+  if type(t) ~= "table" then return nil end
+  local name = t.name
+  if name and name ~= "" then
+    return tostring(name) .. "#" .. tostring(math.floor(tonumber(t.damage) or 0))
+  end
+  local label = cleanLabel(t.label)
+  if label and label ~= "" and label ~= "?" then return "label:" .. label end
+  return nil
+end
+
+-- Craftable entries carry NO .label and NO .name of their own — the live
+-- diagnostic showed every one reporting "label=?". Identity is only available
+-- by calling getItemStack() on each, which costs one bridge round-trip per
+-- entry (152 of them on this network). That is far too slow for the 3s
+-- refresh, so the catalogue is loaded separately and cached.
+local CRAFT_RELOAD_SECONDS = 120
+
+local function loadCraftables(onProgress)
+  local entries = tableEntries(safeCall(meAddr, "getCraftables"))
+  local craftSet, nCraft = {}, 0
+
+  for i, entry in ipairs(entries) do
+    -- getItemStack is a table with a hidden __call metamethod; calling it
+    -- normally is confirmed working against the live bridge.
+    local ok, stack = pcall(function() return entry.getItemStack() end)
+    if ok and type(stack) == "table" then
+      local key = stackKey(stack)
+      if key and not craftSet[key] then
+        craftSet[key] = {entry = entry, label = cleanLabel(stack.label or stack.name)}
+        nCraft = nCraft + 1
+      end
+    end
+    if onProgress and (i % 25 == 0 or i == #entries) then onProgress(i, #entries) end
+  end
+
+  state.craftSet = craftSet
+  state.craftableCount = nCraft
+  state.craftLoadedAt = computer.uptime()
+end
 
 local function refresh()
   if not meAddr then
@@ -143,20 +194,6 @@ local function refresh()
     state.lastOk = false
     return
   end
-
-  -- Craftables first, so the item list can be tagged in one pass.
-  local craftables = tableEntries(safeCall(meAddr, "getCraftables"))
-  local craftSet = {}
-  local nCraft = 0
-  for _, c in ipairs(craftables) do
-    local key = cleanLabel(c.label or c.name or "")
-    if key ~= "" and not craftSet[key] then
-      craftSet[key] = c
-      nCraft = nCraft + 1
-    end
-  end
-  state.craftSet = craftSet
-  state.craftableCount = nCraft
 
   local rawItems, err = safeCall(meAddr, "getItemsInNetwork")
   if not rawItems then
@@ -168,17 +205,28 @@ local function refresh()
     state.lastOk = true
   end
 
-  local items = {}
+  local items, seen = {}, {}
   for _, it in ipairs(tableEntries(rawItems)) do
-    local label = cleanLabel(it.label or it.name or "?")
+    local key = stackKey(it)
+    local craft = key and state.craftSet[key] or nil
     items[#items + 1] = {
-      label = label,
+      label = cleanLabel(it.label or it.name or "?"),
       count = tonumber(it.size or it.count) or 0,
-      craftable = craftSet[label] ~= nil,
+      craftEntry = craft and craft.entry or nil,
     }
+    if key then seen[key] = true end
   end
-  table.sort(items, function(a, b) return a.label:lower() < b.label:lower() end)
+
+  -- Surface craftables the network holds none of, so you can still order
+  -- something you have zero of — otherwise they'd be invisible and unorderable.
+  for key, c in pairs(state.craftSet) do
+    if not seen[key] then
+      items[#items + 1] = {label = c.label, count = 0, craftEntry = c.entry}
+    end
+  end
+
   state.items = items
+  invalidateView()
 
   state.power    = tonumber(safeCall(meAddr, "getStoredPower")) or 0
   state.maxPower = tonumber(safeCall(meAddr, "getMaxStoredPower")) or 0
@@ -192,29 +240,69 @@ end
 
 -- ============================ auto-crafting (gated) =========================
 -- getCraftables() entries report type(entry.request) == "table", not
--- "function" — suspected hidden __call metamethod rather than a plain
--- function. Do NOT flip this on without confirmed diag_craft2.lua output:
--- a wrong calling convention can misfire against the live ME network with
--- real materials and power on the line.
-local CRAFT_CONFIRMED = false
+-- Calling convention CONFIRMED against the live network by diag_craft2.lua:
+-- entry.request and entry.getItemStack report type()=="table", but both carry
+-- a metatable whose __call is a function, and entry.getItemStack() invoked as
+-- a plain call succeeded and returned a real stack. entry.request(qty) uses
+-- the same mechanism.
+local CRAFT_CONFIRMED = true
 
 local function requestCraft(entry, qty)
   if not CRAFT_CONFIRMED then
     return false, "crafting locked — run diag_craft2.lua first"
   end
+  if type(entry) ~= "table" then
+    return false, "no craftable entry for this item"
+  end
+
   local ok, result = pcall(function() return entry.request(qty) end)
   if not ok then return false, tostring(result) end
-  if result == nil then return false, "request() returned nil (call convention wrong?)" end
-  return true, result
+  if result == nil then
+    return false, "request() returned nil — call convention may have changed"
+  end
+
+  -- AE2 hands back a craft-status object. Report whatever it says rather than
+  -- assuming the job was accepted just because the call did not error.
+  local note = ""
+  if type(result) == "table" then
+    local okc, canceled = pcall(function() return result.isCanceled() end)
+    if okc and canceled == true then
+      return false, "ME network refused the job (reported canceled)"
+    end
+  end
+  return true, note
 end
 
 -- ================================ UI state ==================================
+
+-- Sort modes, cycled with `s`. Every comparator falls back to name so the
+-- order is total and stable-looking rather than arbitrary within ties.
+local function byName(a, b) return a.label:lower() < b.label:lower() end
+
+local SORTS = {
+  {label = "name A-Z", cmp = byName},
+  {label = "name Z-A", cmp = function(a, b) return a.label:lower() > b.label:lower() end},
+  {label = "qty high", cmp = function(a, b)
+    if a.count ~= b.count then return a.count > b.count end
+    return byName(a, b)
+  end},
+  {label = "qty low", cmp = function(a, b)
+    if a.count ~= b.count then return a.count < b.count end
+    return byName(a, b)
+  end},
+  {label = "craftable", cmp = function(a, b)
+    local ac, bc = a.craftEntry ~= nil, b.craftEntry ~= nil
+    if ac ~= bc then return ac end
+    return byName(a, b)
+  end},
+}
 
 local ui = {
   top = 1, selected = 1,
   filterText = "", filterMode = false,
   craftMode = false, craftQty = "", craftTarget = nil,
   status = nil, statusKind = "info",   -- info | good | bad
+  sort = 1,
 }
 
 local function setStatus(msg, kind)
@@ -223,13 +311,23 @@ local function setStatus(msg, kind)
 end
 
 local function filteredItems()
-  if ui.filterText == "" then return state.items end
-  local needle = ui.filterText:lower()
-  local out = {}
-  for _, it in ipairs(state.items) do
-    if it.label:lower():find(needle, 1, true) then out[#out + 1] = it end
+  if not viewDirty then return viewCache end
+
+  local out
+  if ui.filterText == "" then
+    out = {}
+    for i, it in ipairs(state.items) do out[i] = it end
+  else
+    local needle = ui.filterText:lower()
+    out = {}
+    for _, it in ipairs(state.items) do
+      if it.label:lower():find(needle, 1, true) then out[#out + 1] = it end
+    end
   end
-  return out
+
+  table.sort(out, SORTS[ui.sort].cmp)
+  viewCache, viewDirty = out, false
+  return viewCache
 end
 
 -- ================================ rendering =================================
@@ -334,8 +432,8 @@ local function barFrac(v, maxv)
 end
 
 local function drawListFrame()
-  local title = "STORAGE"
-  if ui.filterText ~= "" then title = "STORAGE · filter: " .. ui.filterText end
+  local title = "STORAGE · sort: " .. SORTS[ui.sort].label
+  if ui.filterText ~= "" then title = title .. " · filter: " .. ui.filterText end
 
   bg(C.bg); fg(C.border)
   local lead = "─ " .. title .. " "
@@ -405,7 +503,7 @@ local function drawList()
         gset(c.xBar + filled, y, string.rep("·", c.bar - filled))
       end
 
-      if it.craftable then
+      if it.craftEntry then
         fg(C.craft)
         gset(c.xTag, y, "✦ craft")
       end
@@ -486,7 +584,7 @@ local function drawFooter()
 
   -- Keybinding hints: keys in accent, descriptions dim.
   local hints = {
-    {"R", "refresh"}, {"j/k", "move"}, {"/", "filter"},
+    {"R", "refresh"}, {"j/k", "move"}, {"/", "filter"}, {"S", "sort"},
     {"C", "craft"}, {"Esc", "clear"}, {"Q", "quit"},
   }
   local x = 2
@@ -518,11 +616,14 @@ local function handleFilterKey(char, code)
   elseif code == KEY_ESC then
     ui.filterMode = false
     ui.filterText = ""
+    invalidateView()
   elseif code == KEY_BACK then
     ui.filterText = usub(ui.filterText, 1, math.max(0, ulen(ui.filterText) - 1))
+    invalidateView()
   elseif char and char >= 32 and char < 127 then
     ui.filterText = ui.filterText .. string.char(char)
     ui.selected, ui.top = 1, 1
+    invalidateView()
   end
 end
 
@@ -547,13 +648,12 @@ local function handleCraftKey(char, code)
       setStatus("craft cancelled: no item selected", "bad")
       return
     end
-    local entry = state.craftSet[target.label]
-    if not entry then
+    if not target.craftEntry then
       setStatus("craft failed: '" .. target.label .. "' is not craftable", "bad")
       return
     end
 
-    local ok, result = requestCraft(entry, qty)
+    local ok, result = requestCraft(target.craftEntry, qty)
     if ok then
       setStatus("craft requested: " .. target.label .. " x" .. comma(qty), "good")
     else
@@ -573,6 +673,9 @@ local function handleKey(char, code)
   if ch == "q" then
     return "quit"
   elseif ch == "r" then
+    -- A manual refresh is deliberate, so rebuild the craftable catalogue too;
+    -- that is how a newly-added recipe shows up without restarting.
+    state.craftLoadedAt = nil
     refresh()
     setStatus("refreshed", "good")
   elseif ch == "j" or code == KEY_DOWN then
@@ -590,14 +693,21 @@ local function handleKey(char, code)
   elseif ch == "/" then
     ui.filterMode = true
     ui.filterText = ""
+    invalidateView()
+  elseif ch == "s" then
+    ui.sort = (ui.sort % #SORTS) + 1
+    ui.selected, ui.top = 1, 1
+    invalidateView()
+    setStatus("sorted by " .. SORTS[ui.sort].label, "info")
   elseif code == KEY_ESC then
     ui.filterText = ""
     ui.selected, ui.top = 1, 1
+    invalidateView()
   elseif ch == "c" then
     local it = list[ui.selected]
     if not it then
       setStatus("nothing selected", "bad")
-    elseif not state.craftSet[it.label] then
+    elseif not it.craftEntry then
       -- Refuse up front rather than after prompting for a quantity.
       setStatus("'" .. it.label .. "' is not craftable in this network", "bad")
     else
@@ -623,8 +733,19 @@ local function teardown()
   term.setCursor(1, 1)
 end
 
+-- Building the craftable catalogue costs one bridge call per entry, so show
+-- progress instead of appearing to hang on a large network.
+local function craftProgress(done, total)
+  bg(C.bg); gfill(1, math.floor(H / 2), W, 1, " ")
+  fg(C.accent)
+  local msg = string.format("Loading craftable catalogue…  %d / %d", done, total)
+  gset(math.max(1, math.floor((W - ulen(msg)) / 2)), math.floor(H / 2), msg)
+end
+
 local function main()
   setup()
+  bg(C.bg); gfill(1, 1, W, H, " ")
+  loadCraftables(craftProgress)
   refresh()
   render()
 
@@ -636,6 +757,12 @@ local function main()
     end
 
     if computer.uptime() - lastRefresh >= 3 then
+      -- Recipes change far more slowly than stock levels, so the expensive
+      -- catalogue rebuild runs on its own much longer interval.
+      if not state.craftLoadedAt
+         or computer.uptime() - state.craftLoadedAt >= CRAFT_RELOAD_SECONDS then
+        loadCraftables()
+      end
       refresh()
       lastRefresh = computer.uptime()
     end
