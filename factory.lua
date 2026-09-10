@@ -67,6 +67,25 @@ local C = {
   barTrack  = 0x1E3038,
 }
 
+-- Collections coming back over this bridge are not always clean arrays: they
+-- can carry a trailing count field (n = 136) or other scalars alongside the
+-- array part, so a bare pairs() loop yields numbers where tables are expected.
+-- Prefer the sequential part, and fall back to a filtered pairs() only if the
+-- bridge handed back non-sequential keys.
+local function tableEntries(t)
+  local out = {}
+  if type(t) ~= "table" then return out end
+  for _, v in ipairs(t) do
+    if type(v) == "table" then out[#out + 1] = v end
+  end
+  if #out == 0 then
+    for _, v in pairs(t) do
+      if type(v) == "table" then out[#out + 1] = v end
+    end
+  end
+  return out
+end
+
 -- ============================== draw helpers ================================
 
 local W, H = 80, 25
@@ -126,10 +145,10 @@ local function refresh()
   end
 
   -- Craftables first, so the item list can be tagged in one pass.
-  local craftables = safeCall(meAddr, "getCraftables") or {}
+  local craftables = tableEntries(safeCall(meAddr, "getCraftables"))
   local craftSet = {}
   local nCraft = 0
-  for _, c in pairs(craftables) do
+  for _, c in ipairs(craftables) do
     local key = cleanLabel(c.label or c.name or "")
     if key ~= "" and not craftSet[key] then
       craftSet[key] = c
@@ -150,24 +169,24 @@ local function refresh()
   end
 
   local items = {}
-  for _, it in pairs(rawItems) do
+  for _, it in ipairs(tableEntries(rawItems)) do
     local label = cleanLabel(it.label or it.name or "?")
     items[#items + 1] = {
       label = label,
-      count = it.size or it.count or 0,
+      count = tonumber(it.size or it.count) or 0,
       craftable = craftSet[label] ~= nil,
     }
   end
   table.sort(items, function(a, b) return a.label:lower() < b.label:lower() end)
   state.items = items
 
-  state.power    = safeCall(meAddr, "getStoredPower") or 0
-  state.maxPower = safeCall(meAddr, "getMaxStoredPower") or 0
+  state.power    = tonumber(safeCall(meAddr, "getStoredPower")) or 0
+  state.maxPower = tonumber(safeCall(meAddr, "getMaxStoredPower")) or 0
 
-  local cpus = safeCall(meAddr, "getCpus") or {}
+  local cpus = tableEntries(safeCall(meAddr, "getCpus"))
   state.cpus = cpus
   local busy = 0
-  for _, c in pairs(cpus) do if c.busy then busy = busy + 1 end end
+  for _, c in ipairs(cpus) do if c.busy then busy = busy + 1 end end
   state.cpuBusy = busy
 end
 
