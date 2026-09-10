@@ -595,28 +595,20 @@ local function evaluateAutoCraft()
           backingOff = since ~= nil
         end
 
-        if entry and needed and needed >= 1 and not backingOff then
-          local remaining = needed - quantityInFlight(label)
-          local sent, dispatched = 0, 0
-
-          -- One request per free CPU, each capped at maxBatch, until either
-          -- the CPUs or the outstanding quantity run out.
-          while remaining >= 1 and budget > 0 do
-            local batch = math.min(remaining, maxBatch)
-            local ok, result = requestCraft(entry, batch, label)
-            if not ok then
-              setStatus("auto-craft failed: " .. label .. " - " .. tostring(result), "bad")
-              break
-            end
-            remaining  = remaining - batch
-            budget     = budget - 1
-            sent       = sent + batch
-            dispatched = dispatched + 1
-          end
-
-          if sent > 0 then
-            setStatus(string.format("auto-craft: %s x%s across %d job%s",
-              label, comma(sent), dispatched, dispatched == 1 and "" or "s"), "info")
+        -- One live job per rule. A second concurrent job for the same recipe
+        -- draws from the same ingredient pool, so it adds no throughput — it
+        -- just stalls until the first job releases those inputs, which looks
+        -- like a hung CPU. Parallelism comes from running DIFFERENT rules on
+        -- different CPUs, where the ingredient chains are independent.
+        if entry and needed and needed >= 1 and not backingOff
+           and quantityInFlight(label) == 0 then
+          local batch = math.min(needed, maxBatch)
+          local ok, result = requestCraft(entry, batch, label)
+          if ok then
+            budget = budget - 1
+            setStatus("auto-craft: " .. label .. " x" .. comma(batch), "info")
+          else
+            setStatus("auto-craft failed: " .. label .. " - " .. tostring(result), "bad")
           end
         end
       end
