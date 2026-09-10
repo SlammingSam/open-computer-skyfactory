@@ -434,10 +434,15 @@ local ui = {
   acTop = 1,            -- first visible row of that list
 
   -- Add-auto-craft-rule wizard, started from the dashboard with a craftable
-  -- item selected; step 1 picks direction, 2 the threshold, 3 the craft qty.
+  -- item selected. Steps differ by direction:
+  --   below: direction -> threshold -> qty
+  --   above: direction -> threshold -> keep -> pickCraft -> ratio
+  -- "above" converts a surplus into a DIFFERENT item, so it needs both that
+  -- item and how many of the watched item one of them consumes.
   acAdd = {
-    active = false, step = 1, target = nil,
-    direction = nil, thresholdText = "", craftQtyText = "",
+    active = false, step = "direction", target = nil, direction = nil,
+    thresholdText = "", craftQtyText = "",
+    keepText = "", ratioText = "", craftTarget = nil,
   },
 }
 
@@ -473,7 +478,22 @@ end
 -- (settings-configurable) interval regardless of how often this is called,
 -- and a per-rule cooldown plus hasActiveJobFor() keep a persistently-crossed
 -- threshold from resubmitting the same request every tick.
+--
+-- The two directions do genuinely different things:
+--   below  stock ran low  -> craft more OF the watched item, a fixed qty.
+--   above  stock piled up -> convert the surplus INTO a different item,
+--          crafting floor((count - keep) / ratio) of it. That quantity is
+--          computed from live stock rather than fixed, so it drains to the
+--          floor in one go and never asks for more ingredients than exist.
 local AUTO_CRAFT_COOLDOWN_SECONDS = 60
+
+local function findItemByKey(key)
+  if not key then return nil end          -- else items with a nil key match
+  for _, it in ipairs(state.items) do
+    if it.key == key then return it end
+  end
+  return nil
+end
 
 local function evaluateAutoCraft()
   local ac = settings.autoCraft
@@ -487,25 +507,40 @@ local function evaluateAutoCraft()
 
   for _, rule in ipairs(ac.rules) do
     if rule.enabled then
-      local current
-      for _, it in ipairs(state.items) do
-        if it.key == rule.key then current = it; break end
-      end
+      local watched = findItemByKey(rule.key)
+      if watched then
+        -- Work out what to craft and how much, per direction.
+        local entry, qty, label
 
-      if current and current.craftEntry then
-        local triggered =
-          (rule.direction == "below" and current.count < rule.threshold)
-          or (rule.direction == "above" and current.count > rule.threshold)
+        if rule.direction == "below" then
+          if watched.count < (tonumber(rule.threshold) or 0) then
+            entry, qty, label = watched.craftEntry, tonumber(rule.craftQty) or 0, rule.label
+          end
+        elseif watched.count > (tonumber(rule.threshold) or 0) then
+          local target = findItemByKey(rule.craftKey)
+          local ratio  = math.max(1, math.floor(tonumber(rule.ratio) or 1))
+          local keep   = math.max(0, tonumber(rule.keep) or 0)
+          if target then
+            entry = target.craftEntry
+            qty   = math.floor((watched.count - keep) / ratio)
+            label = rule.craftLabel or target.label
+          end
+        end
 
-        if triggered then
-          local last = state.autoCraftLastFired[rule.key]
+        if entry and qty and qty >= 1 then
+          -- Keyed by item AND direction: one item can carry both a restock
+          -- and a surplus rule, and they must not share a cooldown slot.
+          local fireKey = tostring(rule.key) .. "|" .. tostring(rule.direction)
+          local last = state.autoCraftLastFired[fireKey]
           local cooled = (not last) or (computer.uptime() - last >= AUTO_CRAFT_COOLDOWN_SECONDS)
-          if cooled and not hasActiveJobFor(rule.label) then
-            local ok, result = requestCraft(current.craftEntry, rule.craftQty, rule.label)
-            state.autoCraftLastFired[rule.key] = computer.uptime()
+          -- Dedupe against the item actually being crafted, which for an
+          -- "above" rule is not the item the rule watches.
+          if cooled and not hasActiveJobFor(label) then
+            local ok, result = requestCraft(entry, qty, label)
+            state.autoCraftLastFired[fireKey] = computer.uptime()
             setStatus(
-              ok and ("auto-craft: " .. rule.label .. " x" .. comma(rule.craftQty))
-                  or ("auto-craft failed: " .. rule.label .. " - " .. tostring(result)),
+              ok and ("auto-craft: " .. label .. " x" .. comma(qty))
+                  or ("auto-craft failed: " .. label .. " - " .. tostring(result)),
               ok and "info" or "bad"
             )
           end
@@ -795,18 +830,33 @@ local function drawFooter()
   end
 
   if ui.acAdd.active then
-    local name = ui.acAdd.target and ui.acAdd.target.label or "?"
+    local w = ui.acAdd
+    local name = w.target and w.target.label or "?"
+    local craftName = w.craftTarget and w.craftTarget.label or "?"
+
     fg(C.craft); gset(2, H, "AUTO-CRAFT ")
-    if ui.acAdd.step == 1 then
-      fg(C.selFg); gset(13, H, name .. "  below(<) or above(>) threshold?")
-    elseif ui.acAdd.step == 2 then
-      local dirTxt = ui.acAdd.direction == "below" and "<" or ">"
-      fg(C.selFg); gset(13, H, name .. "  " .. dirTxt .. " " .. ui.acAdd.thresholdText .. "_")
-    else
-      fg(C.selFg); gset(13, H, name .. "  craft qty: " .. ui.acAdd.craftQtyText .. "_")
+    fg(C.selFg)
+
+    local prompt, hint
+    if w.step == "direction" then
+      prompt = name .. "  below(<) or above(>) threshold?"
+    elseif w.step == "threshold" then
+      local dirTxt = (w.direction == "below") and "<" or ">"
+      prompt = name .. "  trigger when " .. dirTxt .. " " .. w.thresholdText .. "_"
+    elseif w.step == "qty" then
+      prompt = name .. "  craft how many each time? " .. w.craftQtyText .. "_"
+    elseif w.step == "keep" then
+      prompt = name .. "  keep how many in stock? " .. w.keepText .. "_"
+    elseif w.step == "pickCraft" then
+      prompt = "surplus " .. name .. " -> pick the item to craft, then Enter"
+      hint = "j/k move · / filter · Enter pick · " .. CANCEL_HINT .. " cancel"
+    else -- ratio
+      prompt = name .. " consumed per " .. craftName .. ": " .. w.ratioText .. "_"
     end
+
+    gset(13, H, prompt)
     fg(C.label)
-    local hint = "Enter confirm · " .. CANCEL_HINT .. " cancel"
+    hint = hint or ("Enter confirm · " .. CANCEL_HINT .. " cancel")
     gset(W - ulen(hint) - 1, H, hint)
     return
   end
@@ -856,8 +906,33 @@ local function drawSettingsHeader()
   bg(C.headerBg)
 end
 
+-- Geometry derived from W, the same discipline the storage table uses, so the
+-- header and its rows can't drift apart and a narrow screen still lines up.
+local function acColumns()
+  local c = {}
+  c.xItem  = 5
+  c.wItem  = math.max(12, math.min(30, math.floor(W * 0.22)))
+  c.xWhen  = c.xItem + c.wItem + 2
+  c.wWhen  = 13
+  c.xAct   = c.xWhen + c.wWhen + 2
+  c.xState = W - 5
+  c.wAct   = math.max(8, c.xState - c.xAct - 2)
+  return c
+end
+
+-- One-line description of what a rule actually does when it fires.
+local function ruleAction(rule)
+  if rule.direction == "below" then
+    return "craft " .. comma(rule.craftQty or 0)
+  end
+  return "-> " .. (rule.craftLabel or "?")
+    .. "  keep " .. comma(rule.keep or 0)
+    .. "  " .. tostring(rule.ratio or 1) .. ":1"
+end
+
 local function drawAutoCraftTab()
   local ac = settings.autoCraft
+  local c = acColumns()
 
   bg(C.bg); gfill(1, 2, W, 1, " ")
   fg(C.label); gset(2, 2, "AUTO-CRAFT")
@@ -870,10 +945,10 @@ local function drawAutoCraftTab()
   gfill(1, 5, W, 1, " ")
   gset(1, 5, "│"); gset(W, 5, "│")
   fg(C.label)
-  gset(3, 5, fit("ITEM", 30))
-  gset(34, 5, fit("WHEN", 14))
-  gset(49, 5, ralign("CRAFT", 10))
-  gset(61, 5, "STATE")
+  gset(c.xItem, 5, fit("WATCH", c.wItem))
+  gset(c.xWhen, 5, fit("WHEN", c.wWhen))
+  gset(c.xAct,  5, fit("ACTION", c.wAct))
+  gset(c.xState, 5, "STATE")
   fg(C.border)
   gset(1, 6, "├" .. string.rep("─", W - 2) .. "┤")
 
@@ -904,13 +979,14 @@ local function drawAutoCraftTab()
       fg(selected and C.accent or C.border)
       gset(3, y, selected and "▸ " or "  ")
       fg(selected and C.selFg or C.text)
-      gset(5, y, fit(rule.label, 28))
+      gset(c.xItem, y, fit(rule.label, c.wItem))
       fg(C.label)
-      gset(34, y, fit((rule.direction == "below" and "< " or "> ") .. comma(rule.threshold), 14))
+      gset(c.xWhen, y, fit(
+        (rule.direction == "below" and "< " or "> ") .. comma(rule.threshold), c.wWhen))
       fg(C.craft)
-      gset(49, y, ralign(comma(rule.craftQty), 10))
+      gset(c.xAct, y, fit(ruleAction(rule), c.wAct))
       fg(rule.enabled and C.good or C.zero)
-      gset(61, y, rule.enabled and "on" or "off")
+      gset(c.xState, y, rule.enabled and "on" or "off")
     end
   end
 
@@ -976,6 +1052,24 @@ end
 
 -- ============================= input handling ===============================
 
+-- Shared list navigation, used by the dashboard and by the wizard's
+-- craft-target picker so the two can't drift apart.
+local function moveSelection(ch, code, list)
+  if ch == "j" or code == KEY_DOWN then
+    ui.selected = math.min(#list, ui.selected + 1)
+  elseif ch == "k" or code == KEY_UP then
+    ui.selected = math.max(1, ui.selected - 1)
+  elseif code == KEY_PGDN then
+    ui.selected = math.min(#list, ui.selected + visibleRows())
+  elseif code == KEY_PGUP then
+    ui.selected = math.max(1, ui.selected - visibleRows())
+  elseif code == KEY_HOME then
+    ui.selected = 1
+  elseif code == KEY_END then
+    ui.selected = #list
+  end
+end
+
 local function handleFilterKey(char, code)
   if code == KEY_ENTER then
     ui.filterMode = false
@@ -1033,75 +1127,176 @@ local function handleCraftKey(char, code)
 end
 
 local function resetAutoCraftAdd()
-  ui.acAdd = {active = false, step = 1, target = nil, direction = nil, thresholdText = "", craftQtyText = ""}
+  ui.acAdd = {
+    active = false, step = "direction", target = nil, direction = nil,
+    thresholdText = "", craftQtyText = "",
+    keepText = "", ratioText = "", craftTarget = nil,
+  }
 end
 
+-- Commits the wizard's collected answers as a rule and persists them.
+local function commitAutoCraftRule()
+  local w = ui.acAdd
+  local target = w.target
+  local threshold = tonumber(w.thresholdText)
+
+  if not target or not target.key then
+    setStatus("auto-craft rule cancelled: item has no stable identity", "bad")
+    return
+  end
+
+  local rule = {
+    key = target.key, label = target.label,
+    direction = w.direction, threshold = threshold, enabled = true,
+  }
+
+  if w.direction == "below" then
+    local qty = tonumber(w.craftQtyText)
+    if not qty or qty <= 0 then
+      setStatus("auto-craft rule cancelled: craft qty must be positive", "bad")
+      return
+    end
+    rule.craftQty = qty
+  else
+    local keep  = tonumber(w.keepText)
+    local ratio = tonumber(w.ratioText)
+    local craft = w.craftTarget
+    if not keep or keep < 0 then
+      setStatus("auto-craft rule cancelled: keep amount must be 0 or more", "bad")
+      return
+    end
+    if keep >= threshold then
+      setStatus("auto-craft rule cancelled: keep must be below the trigger", "bad")
+      return
+    end
+    if not ratio or ratio < 1 then
+      setStatus("auto-craft rule cancelled: ratio must be 1 or more", "bad")
+      return
+    end
+    if not craft or not craft.key or not craft.craftEntry then
+      setStatus("auto-craft rule cancelled: craft target is not craftable", "bad")
+      return
+    end
+    rule.keep, rule.ratio = keep, math.floor(ratio)
+    rule.craftKey, rule.craftLabel = craft.key, craft.label
+  end
+
+  -- Replace an existing rule only when the watched item AND direction both
+  -- match, so one item can carry both a restock ("below") and a surplus
+  -- conversion ("above") rule without either clobbering the other.
+  local rules = settings.autoCraft.rules
+  for i = #rules, 1, -1 do
+    if rules[i].key == target.key and rules[i].direction == w.direction then
+      table.remove(rules, i)
+    end
+  end
+  rules[#rules + 1] = rule
+
+  local ok, err = saveSettings(settings)
+  setStatus(
+    ok and ("auto-craft rule saved: " .. target.label)
+        or ("rule added but NOT saved to disk: " .. tostring(err)),
+    ok and "good" or "bad"
+  )
+end
+
+-- Reads a digit/backspace into `field`, returning the updated text. Shared by
+-- every numeric step so they can't drift apart.
+local function editNumber(text, char, code, maxLen)
+  if code == KEY_BACK then return text:sub(1, -2) end
+  if char and char >= 48 and char <= 57 and #text < maxLen then
+    return text .. string.char(char)
+  end
+  return text
+end
+
+-- The pickCraft step drives the storage list directly (move/filter/pick)
+-- rather than deferring to the dashboard handler, so keys like a/o/c can't
+-- restart or navigate away from a half-built rule.
 local function handleAutoCraftAddKey(char, code)
   local w = ui.acAdd
+
   if isCancel(code) then
     resetAutoCraftAdd()
     setStatus("auto-craft rule cancelled", "info")
     return
   end
 
-  if w.step == 1 then
+  if w.step == "direction" then
     if char == string.byte("<") then
-      w.direction, w.step = "below", 2
+      w.direction, w.step = "below", "threshold"
     elseif char == string.byte(">") then
-      w.direction, w.step = "above", 2
+      w.direction, w.step = "above", "threshold"
     end
     return
   end
 
-  if w.step == 2 then
-    if code == KEY_BACK then
-      w.thresholdText = w.thresholdText:sub(1, -2)
-    elseif char and char >= 48 and char <= 57 then
-      if #w.thresholdText < 9 then w.thresholdText = w.thresholdText .. string.char(char) end
-    elseif code == KEY_ENTER then
+  if w.step == "threshold" then
+    if code == KEY_ENTER then
       local n = tonumber(w.thresholdText)
       if not n or n < 0 then
-        setStatus("threshold must be a non-negative number", "bad")
+        setStatus("trigger must be a non-negative number", "bad")
       else
-        w.step = 3
+        w.step = (w.direction == "below") and "qty" or "keep"
       end
+    else
+      w.thresholdText = editNumber(w.thresholdText, char, code, 9)
     end
     return
   end
 
-  -- step 3: craft quantity
-  if code == KEY_BACK then
-    w.craftQtyText = w.craftQtyText:sub(1, -2)
-  elseif char and char >= 48 and char <= 57 then
-    if #w.craftQtyText < 7 then w.craftQtyText = w.craftQtyText .. string.char(char) end
-  elseif code == KEY_ENTER then
-    local qty = tonumber(w.craftQtyText)
-    local threshold = tonumber(w.thresholdText)
-    local target = w.target
-
-    if not qty or qty <= 0 then
-      setStatus("auto-craft rule cancelled: craft qty must be positive", "bad")
-    elseif not target or not target.key then
-      setStatus("auto-craft rule cancelled: item has no stable identity", "bad")
+  if w.step == "qty" then                       -- below only
+    if code == KEY_ENTER then
+      commitAutoCraftRule()
+      resetAutoCraftAdd()
     else
-      -- Replace any existing rule for the same item rather than duplicating.
-      local rules = settings.autoCraft.rules
-      for i = #rules, 1, -1 do
-        if rules[i].key == target.key then table.remove(rules, i) end
-      end
-      rules[#rules + 1] = {
-        key = target.key, label = target.label,
-        direction = w.direction, threshold = threshold,
-        craftQty = qty, enabled = true,
-      }
-      local ok, err = saveSettings(settings)
-      setStatus(
-        ok and ("auto-craft rule saved: " .. target.label)
-            or ("rule added but NOT saved to disk: " .. tostring(err)),
-        ok and "good" or "bad"
-      )
+      w.craftQtyText = editNumber(w.craftQtyText, char, code, 7)
     end
+    return
+  end
+
+  if w.step == "keep" then                      -- above only
+    if code == KEY_ENTER then
+      local n = tonumber(w.keepText)
+      if not n or n < 0 then
+        setStatus("keep amount must be 0 or more", "bad")
+      else
+        w.step = "pickCraft"
+      end
+    else
+      w.keepText = editNumber(w.keepText, char, code, 9)
+    end
+    return
+  end
+
+  if w.step == "pickCraft" then                 -- above only
+    local list = filteredItems()
+    if code == KEY_ENTER then
+      local it = list[ui.selected]
+      if not it then
+        setStatus("nothing selected", "bad")
+      elseif not it.craftEntry then
+        setStatus("'" .. it.label .. "' is not craftable in this network", "bad")
+      elseif not it.key then
+        setStatus("'" .. it.label .. "' has no stable identity", "bad")
+      else
+        w.craftTarget, w.step = it, "ratio"
+      end
+    elseif char == string.byte("/") then
+      ui.filterMode, ui.filterText = true, ""
+      invalidateView()
+    else
+      moveSelection((char and char > 0) and string.char(char):lower() or "", code, list)
+    end
+    return
+  end
+
+  -- ratio (above only)
+  if code == KEY_ENTER then
+    commitAutoCraftRule()
     resetAutoCraftAdd()
+  else
+    w.ratioText = editNumber(w.ratioText, char, code, 4)
   end
 end
 
@@ -1174,18 +1369,9 @@ local function handleKey(char, code)
     state.craftLoadedAt = nil
     refresh()
     setStatus("refreshed", "good")
-  elseif ch == "j" or code == KEY_DOWN then
-    ui.selected = math.min(#list, ui.selected + 1)
-  elseif ch == "k" or code == KEY_UP then
-    ui.selected = math.max(1, ui.selected - 1)
-  elseif code == KEY_PGDN then
-    ui.selected = math.min(#list, ui.selected + visibleRows())
-  elseif code == KEY_PGUP then
-    ui.selected = math.max(1, ui.selected - visibleRows())
-  elseif code == KEY_HOME then
-    ui.selected = 1
-  elseif code == KEY_END then
-    ui.selected = #list
+  elseif ch == "j" or ch == "k" or code == KEY_DOWN or code == KEY_UP
+      or code == KEY_PGDN or code == KEY_PGUP or code == KEY_HOME or code == KEY_END then
+    moveSelection(ch, code, list)
   elseif ch == "/" then
     ui.filterMode = true
     ui.filterText = ""
@@ -1218,7 +1404,10 @@ local function handleKey(char, code)
     elseif not it.key then
       setStatus("'" .. it.label .. "' has no stable identity for a rule", "bad")
     else
-      ui.acAdd = {active = true, step = 1, target = it, direction = nil, thresholdText = "", craftQtyText = ""}
+      -- Reset first so the wizard always starts from the full current shape;
+      -- spelling the fields out here is how they drift when the shape changes.
+      resetAutoCraftAdd()
+      ui.acAdd.active, ui.acAdd.target = true, it
     end
   end
 end
