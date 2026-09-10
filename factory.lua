@@ -431,6 +431,7 @@ local ui = {
   page = "dashboard",   -- "dashboard" | "settings"
   settingsTab = 1,      -- index into SETTINGS_TABS
   acSelected = 1,       -- selected row within the auto-craft rule list
+  acTop = 1,            -- first visible row of that list
 
   -- Add-auto-craft-rule wizard, started from the dashboard with a craftable
   -- item selected; step 1 picks direction, 2 the threshold, 3 the craft qty.
@@ -513,6 +514,23 @@ local function evaluateAutoCraft()
     end
   end
 end
+
+-- =============================== key bindings ===============================
+-- Declared above the rendering code because the footer hints name the cancel
+-- key, and a local is only visible from its declaration point onward.
+
+local KEY_ENTER, KEY_BACK, KEY_ESC = 28, 14, 1
+local KEY_UP, KEY_DOWN, KEY_PGUP, KEY_PGDN = 200, 208, 201, 209
+local KEY_HOME, KEY_END = 199, 207
+
+-- Minecraft swallows Esc before the screen ever receives it (it closes the
+-- GUI), so cancel/back is bound to Delete. Esc is still honoured for setups
+-- that do deliver it. If Delete is unusable too, change these two lines and
+-- nothing else — every cancel path and hint reads from them.
+local KEY_CANCEL  = 211       -- Delete
+local CANCEL_HINT = "Del"
+
+local function isCancel(code) return code == KEY_CANCEL or code == KEY_ESC end
 
 -- ================================ rendering =================================
 
@@ -761,7 +779,7 @@ local function drawFooter()
     fg(C.accent); gset(2, H, "FILTER ")
     fg(C.selFg);  gset(9, H, ui.filterText .. "_")
     fg(C.label)
-    local hint = "Enter accept · Backspace edit"
+    local hint = "Enter accept · Backspace edit · " .. CANCEL_HINT .. " cancel"
     gset(W - ulen(hint) - 1, H, hint)
     return
   end
@@ -771,7 +789,7 @@ local function drawFooter()
     fg(C.craft); gset(2, H, "CRAFT ")
     fg(C.selFg); gset(8, H, name .. "  x" .. ui.craftQty .. "_")
     fg(C.label)
-    local hint = "Enter confirm · Esc cancel"
+    local hint = "Enter confirm · " .. CANCEL_HINT .. " cancel"
     gset(W - ulen(hint) - 1, H, hint)
     return
   end
@@ -788,7 +806,7 @@ local function drawFooter()
       fg(C.selFg); gset(13, H, name .. "  craft qty: " .. ui.acAdd.craftQtyText .. "_")
     end
     fg(C.label)
-    local hint = "Enter confirm · Esc cancel"
+    local hint = "Enter confirm · " .. CANCEL_HINT .. " cancel"
     gset(W - ulen(hint) - 1, H, hint)
     return
   end
@@ -809,7 +827,7 @@ local function drawFooter()
   -- Keybinding hints: keys in accent, descriptions dim.
   local hints = {
     {"R", "refresh"}, {"j/k", "move"}, {"/", "filter"}, {"S", "sort"},
-    {"C", "craft"}, {"A", "auto-craft"}, {"O", "settings"}, {"Esc", "clear"}, {"Q", "quit"},
+    {"C", "craft"}, {"A", "auto-craft"}, {"O", "settings"}, {CANCEL_HINT, "clear"}, {"Q", "quit"},
   }
   local x = 2
   for _, h in ipairs(hints) do
@@ -861,12 +879,19 @@ local function drawAutoCraftTab()
 
   local rows = math.max(1, H - 9)
   local rules = ac.rules
+
+  -- Clamp selection and scroll window, same as the storage list: without the
+  -- window the cursor walks off the bottom on a long rule list and D deletes
+  -- something you can no longer see.
   if ui.acSelected > #rules then ui.acSelected = math.max(1, #rules) end
   if ui.acSelected < 1 then ui.acSelected = 1 end
+  if ui.acSelected < ui.acTop then ui.acTop = ui.acSelected end
+  if ui.acSelected > ui.acTop + rows - 1 then ui.acTop = ui.acSelected - rows + 1 end
+  if ui.acTop < 1 then ui.acTop = 1 end
 
   for r = 0, rows - 1 do
     local y = 7 + r
-    local idx = r + 1
+    local idx = ui.acTop + r
     local rule = rules[idx]
     local selected = (idx == ui.acSelected)
     local rowBg = selected and C.selBg or C.bg
@@ -901,9 +926,21 @@ end
 
 local function drawSettingsFooter()
   bg(C.bg); gfill(1, H, W, 1, " ")
+
+  -- Same precedence as the dashboard footer: a status message outranks the
+  -- hints. Without this a save that never reached disk looks exactly like
+  -- one that worked, which is the whole failure mode this page must not have.
+  if ui.status then
+    fg((ui.statusKind == "bad" and C.bad)
+       or (ui.statusKind == "good" and C.good)
+       or C.label)
+    gset(2, H, fit(ui.status, W - 2))
+    return
+  end
+
   local hints = {
     {"j/k", "move"}, {"Enter", "toggle rule"}, {"D", "delete"},
-    {"E", "toggle auto-craft"}, {"O/Esc", "back"}, {"Q", "quit"},
+    {"E", "toggle auto-craft"}, {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
   }
   local x = 2
   for _, h in ipairs(hints) do
@@ -939,14 +976,10 @@ end
 
 -- ============================= input handling ===============================
 
-local KEY_ENTER, KEY_BACK, KEY_ESC = 28, 14, 1
-local KEY_UP, KEY_DOWN, KEY_PGUP, KEY_PGDN = 200, 208, 201, 209
-local KEY_HOME, KEY_END = 199, 207
-
 local function handleFilterKey(char, code)
   if code == KEY_ENTER then
     ui.filterMode = false
-  elseif code == KEY_ESC then
+  elseif isCancel(code) then
     ui.filterMode = false
     ui.filterText = ""
     invalidateView()
@@ -961,7 +994,7 @@ local function handleFilterKey(char, code)
 end
 
 local function handleCraftKey(char, code)
-  if code == KEY_ESC then
+  if isCancel(code) then
     ui.craftMode, ui.craftQty, ui.craftTarget = false, "", nil
     setStatus("craft cancelled", "info")
   elseif code == KEY_BACK then
@@ -1005,7 +1038,7 @@ end
 
 local function handleAutoCraftAddKey(char, code)
   local w = ui.acAdd
-  if code == KEY_ESC then
+  if isCancel(code) then
     resetAutoCraftAdd()
     setStatus("auto-craft rule cancelled", "info")
     return
@@ -1075,10 +1108,13 @@ end
 local function handleSettingsKey(char, code)
   local ch = (char and char > 0) and string.char(char):lower() or ""
   local rules = settings.autoCraft.rules
+  -- Cleared per keypress like the dashboard does, so a message from the last
+  -- action doesn't sit pinned to the footer while you scroll the list.
+  ui.status = nil
 
   if ch == "q" then
     return "quit"
-  elseif ch == "o" or code == KEY_ESC then
+  elseif ch == "o" or isCancel(code) then
     ui.page = "dashboard"
   elseif ch == "j" or code == KEY_DOWN then
     ui.acSelected = math.min(#rules, ui.acSelected + 1)
@@ -1159,7 +1195,7 @@ local function handleKey(char, code)
     ui.selected, ui.top = 1, 1
     invalidateView()
     setStatus("sorted by " .. SORTS[ui.sort].label, "info")
-  elseif code == KEY_ESC then
+  elseif isCancel(code) then
     ui.filterText = ""
     ui.selected, ui.top = 1, 1
     invalidateView()
