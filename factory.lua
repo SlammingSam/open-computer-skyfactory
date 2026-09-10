@@ -142,6 +142,7 @@ local state = {
   err = nil,
   lastOk = false,
   craftLoadedAt = nil,
+  jobs = {},         -- live craft jobs: {label, qty, obj, startedAt, status}
 }
 
 -- Identity key for a stack. In 1.12.2 `damage` is the variant discriminator
@@ -247,7 +248,53 @@ end
 -- the same mechanism.
 local CRAFT_CONFIRMED = true
 
-local function requestCraft(entry, qty)
+-- AE2 crafting is asynchronous: request() starts a plan computation and
+-- returns a status object before the plan exists. Reading isCanceled() right
+-- away is meaningless, and dropping the handle means a job that dies a moment
+-- later (missing ingredient, no free CPU) looks like a success and vanishes.
+-- The handle is therefore kept and polled until it resolves.
+local JOB_KEEP_SECONDS = 20
+
+local function pollJob(job)
+  if type(job.obj) ~= "table" then
+    job.status = "unknown"
+    return
+  end
+  local okd, done = pcall(function() return job.obj.isDone() end)
+  if okd and done == true then
+    job.status = "done"
+    job.endedAt = job.endedAt or computer.uptime()
+    return
+  end
+  local okc, canceled = pcall(function() return job.obj.isCanceled() end)
+  if okc and canceled == true then
+    job.status = "canceled"
+    job.endedAt = job.endedAt or computer.uptime()
+    return
+  end
+  if not okd and not okc then
+    job.status = "unreadable"
+    job.endedAt = job.endedAt or computer.uptime()
+    return
+  end
+  job.status = "computing"
+end
+
+local function pollJobs()
+  local keep = {}
+  for _, job in ipairs(state.jobs) do
+    if job.status ~= "done" and job.status ~= "canceled" and job.status ~= "unreadable" then
+      pollJob(job)
+    end
+    -- Retire finished jobs after a grace period so the outcome stays visible.
+    if not job.endedAt or computer.uptime() - job.endedAt < JOB_KEEP_SECONDS then
+      keep[#keep + 1] = job
+    end
+  end
+  state.jobs = keep
+end
+
+local function requestCraft(entry, qty, label)
   if not CRAFT_CONFIRMED then
     return false, "crafting locked — run diag_craft2.lua first"
   end
@@ -261,16 +308,13 @@ local function requestCraft(entry, qty)
     return false, "request() returned nil — call convention may have changed"
   end
 
-  -- AE2 hands back a craft-status object. Report whatever it says rather than
-  -- assuming the job was accepted just because the call did not error.
-  local note = ""
-  if type(result) == "table" then
-    local okc, canceled = pcall(function() return result.isCanceled() end)
-    if okc and canceled == true then
-      return false, "ME network refused the job (reported canceled)"
-    end
-  end
-  return true, note
+  -- Keep the handle. Do NOT interpret it yet: the plan has not been computed.
+  local job = {
+    label = label or "?", qty = qty, obj = result,
+    startedAt = computer.uptime(), status = "computing",
+  }
+  state.jobs[#state.jobs + 1] = job
+  return true, job
 end
 
 -- ================================ UI state ==================================
@@ -429,6 +473,29 @@ local function barFrac(v, maxv)
   local lm = math.log(maxv + 1)
   if lm <= 0 then return 0 end
   return math.max(0, math.min(1, math.log((v or 0) + 1) / lm))
+end
+
+-- Row 4 was a blank spacer; it now carries live craft-job outcomes so a job
+-- that dies after submission is visible instead of silently disappearing.
+local function drawJobs()
+  bg(C.bg); gfill(1, 4, W, 1, " ")
+  if #state.jobs == 0 then return end
+
+  fg(C.label); gset(2, 4, "JOBS")
+
+  local x = 9
+  for i = #state.jobs, 1, -1 do          -- newest first
+    local job = state.jobs[i]
+    local color =
+      (job.status == "done" and C.good)
+      or (job.status == "canceled" and C.bad)
+      or (job.status == "unreadable" and C.warn)
+      or C.accent
+    local text = job.label .. " x" .. comma(job.qty) .. " · " .. job.status
+    if x + ulen(text) > W - 1 then break end
+    fg(color); gset(x, 4, text)
+    x = x + ulen(text) + 4
+  end
 end
 
 local function drawListFrame()
@@ -599,6 +666,7 @@ local function render()
   drawHeader()
   drawPower()
   drawStats()
+  drawJobs()
   drawListFrame()
   drawList()
   drawFooter()
@@ -653,9 +721,13 @@ local function handleCraftKey(char, code)
       return
     end
 
-    local ok, result = requestCraft(target.craftEntry, qty)
+    local ok, result = requestCraft(target.craftEntry, qty, target.label)
     if ok then
-      setStatus("craft requested: " .. target.label .. " x" .. comma(qty), "good")
+      -- Deliberately not "requested" — the plan has not been computed yet, so
+      -- claiming success here is what hid failing jobs before. The JOBS row
+      -- reports the real outcome.
+      setStatus("craft submitted: " .. target.label .. " x" .. comma(qty)
+                .. " — watch the JOBS row", "info")
     else
       setStatus("craft failed: " .. tostring(result), "bad")
     end
@@ -767,6 +839,9 @@ local function main()
       lastRefresh = computer.uptime()
     end
 
+    -- Cheap (a call or two per live job) and needs to be responsive, so it
+    -- runs every iteration rather than only on the 3s tick.
+    pollJobs()
     render()
   end
 
