@@ -1156,6 +1156,13 @@ local function commitAutoCraftRule()
       setStatus("auto-craft rule cancelled: craft qty must be positive", "bad")
       return
     end
+    -- A restock rule crafts the watched item itself, so THIS is where
+    -- craftability actually has to hold.
+    if not target.craftEntry then
+      setStatus("auto-craft rule cancelled: '" .. target.label
+                .. "' is not craftable in this network", "bad")
+      return
+    end
     rule.craftQty = qty
   else
     local keep  = tonumber(w.keepText)
@@ -1397,10 +1404,12 @@ local function handleKey(char, code)
     end
   elseif ch == "a" then
     local it = list[ui.selected]
+    -- Only a stable identity is required to WATCH an item. Craftability is
+    -- checked later, against whichever item the rule actually crafts: for
+    -- "above" that's the conversion target, not this one (a sieved resource
+    -- you're converting is typically not craftable itself).
     if not it then
       setStatus("nothing selected", "bad")
-    elseif not it.craftEntry then
-      setStatus("'" .. it.label .. "' is not craftable in this network", "bad")
     elseif not it.key then
       setStatus("'" .. it.label .. "' has no stable identity for a rule", "bad")
     else
