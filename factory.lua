@@ -68,6 +68,10 @@ local function defaultSettings()
       -- hold, and AE2 simply cancels the job. Capped requests drain a large
       -- surplus over successive firings instead. Tune to your CPU capacity.
       maxBatch = 1000,
+      -- CPUs held back from auto-crafting so a manual craft (or anything
+      -- else on the network) always has somewhere to run, instead of queuing
+      -- behind a long automated conversion.
+      reserveCpus = 1,
       rules = {},          -- {key, label, direction="below"|"above", threshold, craftQty, enabled}
     },
   }
@@ -212,7 +216,7 @@ local state = {
   lastOk = false,
   craftLoadedAt = nil,
   jobs = {},         -- live craft jobs: {label, qty, obj, startedAt, status}
-  autoCraftLastFired = {},  -- rule.key -> computer.uptime() of last trigger (not persisted)
+  autoCraftBackoff = {},    -- "key|direction" -> uptime a cancelled job was seen
   autoCraftCheckedAt = nil,
 }
 
@@ -389,15 +393,14 @@ local function requestCraft(entry, qty, label)
   return true, job
 end
 
--- Whether `label` already has a live (not yet resolved) job in flight, so
--- auto-craft doesn't pile up duplicate requests for the same item while one
--- is still being planned/executed.
-local function hasActiveJobFor(label)
+-- Whether a job for `label` has recently ended cancelled. AE2 cancels a job
+-- it can't fulfil (a batch too large for a CPU, or an ingredient it can
+-- neither find nor craft), and since dispatch is otherwise gated only by
+-- outstanding quantity, a doomed rule would otherwise re-submit every pass
+-- and keep every CPU busy failing.
+local function recentlyCancelled(label)
   for _, job in ipairs(state.jobs) do
-    if job.label == label and job.status ~= "done"
-       and job.status ~= "canceled" and job.status ~= "unreadable" then
-      return true
-    end
+    if job.label == label and job.status == "canceled" then return true end
   end
   return false
 end
@@ -437,7 +440,9 @@ local ui = {
   settingsTab = 1,      -- index into SETTINGS_TABS
   acSelected = 1,       -- selected row within the auto-craft rule list
   acTop = 1,            -- first visible row of that list
-  acEditBatch = false, acBatchText = "",   -- inline max-batch editor
+  -- Inline editor for a global auto-craft number: nil, "maxBatch" or
+  -- "reserveCpus". One mechanism rather than a flag per setting.
+  acEdit = nil, acEditText = "",
 
   -- Rule editor. One form serves both "add" and "edit": every field is on
   -- screen at once and editable in any order, rather than a blind sequence of
@@ -481,19 +486,25 @@ local function filteredItems()
   return viewCache
 end
 
--- Evaluates every enabled auto-craft rule against live stock and fires
--- requestCraft() for any that cross their threshold. Runs on its own
--- (settings-configurable) interval regardless of how often this is called,
--- and a per-rule cooldown plus hasActiveJobFor() keep a persistently-crossed
--- threshold from resubmitting the same request every tick.
+-- Evaluates every enabled auto-craft rule against live stock and dispatches
+-- craft requests for any that cross their threshold. Runs on its own
+-- (settings-configurable) interval regardless of how often this is called.
 --
 -- The two directions do genuinely different things:
 --   below  stock ran low  -> craft more OF the watched item, a fixed qty.
 --   above  stock piled up -> convert the surplus INTO a different item,
 --          crafting floor((count - keep) / ratio) of it. That quantity is
---          computed from live stock rather than fixed, so it drains to the
---          floor in one go and never asks for more ingredients than exist.
-local AUTO_CRAFT_COOLDOWN_SECONDS = 60
+--          computed from live stock rather than fixed, so it drains toward
+--          the floor and never asks for more ingredients than exist.
+--
+-- Work is split across free crafting CPUs: a single request is capped at
+-- maxBatch (AE2 refuses jobs a CPU can't plan), so a large surplus is issued
+-- as several batches in parallel, one per idle CPU, instead of trickling
+-- through one at a time.
+
+-- How long a rule sits out after AE2 cancels one of its jobs, before it is
+-- allowed to try again (the missing ingredient may have arrived by then).
+local AUTO_CRAFT_RETRY_SECONDS = 120
 
 local function findItemByKey(key)
   if not key then return nil end          -- else items with a nil key match
@@ -501,6 +512,32 @@ local function findItemByKey(key)
     if it.key == key then return it end
   end
   return nil
+end
+
+-- How many further jobs may be dispatched right now: idle CPUs, less the
+-- ones deliberately held in reserve. When the bridge reports no CPU data at
+-- all, fall back to one job so this degrades to serial crafting rather than
+-- never crafting at all.
+local function freeCpuBudget()
+  local total = #state.cpus
+  if total == 0 then return 1 end
+  local reserve = math.max(0, math.floor(tonumber(settings.autoCraft.reserveCpus) or 0))
+  return math.max(0, total - state.cpuBusy - reserve)
+end
+
+-- Quantity of `label` already committed to live jobs. Live jobs will consume
+-- the surplus that this pass can still see sitting in stock, so without
+-- subtracting it every pass would re-request the same conversion and
+-- massively over-craft.
+local function quantityInFlight(label)
+  local total = 0
+  for _, job in ipairs(state.jobs) do
+    if job.label == label and job.status ~= "done"
+       and job.status ~= "canceled" and job.status ~= "unreadable" then
+      total = total + (tonumber(job.qty) or 0)
+    end
+  end
+  return total
 end
 
 local function evaluateAutoCraft()
@@ -513,50 +550,73 @@ local function evaluateAutoCraft()
   end
   state.autoCraftCheckedAt = computer.uptime()
 
+  local maxBatch = math.max(1, math.floor(tonumber(ac.maxBatch) or 1000))
+  local budget = freeCpuBudget()      -- shared across all rules this pass
+
   for _, rule in ipairs(ac.rules) do
+    if budget <= 0 then break end
     if rule.enabled then
       local watched = findItemByKey(rule.key)
       if watched then
-        -- Work out what to craft and how much, per direction.
-        local entry, qty, label
+        -- Work out what to craft and the TOTAL still wanted, per direction.
+        local entry, needed, label
 
         if rule.direction == "below" then
           if watched.count < (tonumber(rule.threshold) or 0) then
-            entry, qty, label = watched.craftEntry, tonumber(rule.craftQty) or 0, rule.label
+            entry, needed, label = watched.craftEntry, tonumber(rule.craftQty) or 0, rule.label
           end
         elseif watched.count > (tonumber(rule.threshold) or 0) then
           local target = findItemByKey(rule.craftKey)
           local ratio  = math.max(1, math.floor(tonumber(rule.ratio) or 1))
           local keep   = math.max(0, tonumber(rule.keep) or 0)
           if target then
-            entry = target.craftEntry
-            qty   = math.floor((watched.count - keep) / ratio)
-            label = rule.craftLabel or target.label
+            entry  = target.craftEntry
+            needed = math.floor((watched.count - keep) / ratio)
+            label  = rule.craftLabel or target.label
           end
         end
 
-        -- Cap the request. Without this a surplus rule asks for more than a
-        -- crafting CPU can plan and AE2 cancels the whole job, so nothing
-        -- drains at all; capped, each firing takes another bite.
-        local maxBatch = math.max(1, math.floor(tonumber(ac.maxBatch) or 1000))
-        if qty then qty = math.min(qty, maxBatch) end
-
-        if entry and qty and qty >= 1 then
-          -- Keyed by item AND direction: one item can carry both a restock
-          -- and a surplus rule, and they must not share a cooldown slot.
+        -- Back off a rule whose jobs AE2 keeps cancelling, so a doomed
+        -- request (batch too big, or an ingredient that can't be sourced)
+        -- doesn't reclaim every free CPU on every pass.
+        local backingOff = false
+        if entry and needed and needed >= 1 then
           local fireKey = tostring(rule.key) .. "|" .. tostring(rule.direction)
-          local last = state.autoCraftLastFired[fireKey]
-          local cooled = (not last) or (computer.uptime() - last >= AUTO_CRAFT_COOLDOWN_SECONDS)
-          -- Dedupe against the item actually being crafted, which for an
-          -- "above" rule is not the item the rule watches.
-          if cooled and not hasActiveJobFor(label) then
-            local ok, result = requestCraft(entry, qty, label)
-            state.autoCraftLastFired[fireKey] = computer.uptime()
-            setStatus(
-              ok and ("auto-craft: " .. label .. " x" .. comma(qty))
-                  or ("auto-craft failed: " .. label .. " - " .. tostring(result)),
-              ok and "info" or "bad"
-            )
+          local since = state.autoCraftBackoff[fireKey]
+          if since and computer.uptime() - since >= AUTO_CRAFT_RETRY_SECONDS then
+            state.autoCraftBackoff[fireKey], since = nil, nil
+          end
+          if not since and recentlyCancelled(label) then
+            state.autoCraftBackoff[fireKey] = computer.uptime()
+            since = computer.uptime()
+            setStatus("auto-craft paused for " .. label
+                      .. ": last job was cancelled — try a smaller max batch", "bad")
+          end
+          backingOff = since ~= nil
+        end
+
+        if entry and needed and needed >= 1 and not backingOff then
+          local remaining = needed - quantityInFlight(label)
+          local sent, dispatched = 0, 0
+
+          -- One request per free CPU, each capped at maxBatch, until either
+          -- the CPUs or the outstanding quantity run out.
+          while remaining >= 1 and budget > 0 do
+            local batch = math.min(remaining, maxBatch)
+            local ok, result = requestCraft(entry, batch, label)
+            if not ok then
+              setStatus("auto-craft failed: " .. label .. " - " .. tostring(result), "bad")
+              break
+            end
+            remaining  = remaining - batch
+            budget     = budget - 1
+            sent       = sent + batch
+            dispatched = dispatched + 1
+          end
+
+          if sent > 0 then
+            setStatus(string.format("auto-craft: %s x%s across %d job%s",
+              label, comma(sent), dispatched, dispatched == 1 and "" or "s"), "info")
           end
         end
       end
@@ -937,16 +997,24 @@ local function drawAutoCraftTab()
   gset(13, 2, ac.enabled and "● ENABLED" or "● DISABLED")
   fg(C.label); gset(24, 2, "(E to toggle)")
 
-  -- Max batch is the difference between a surplus draining and AE2 refusing
-  -- the job outright, so it belongs on screen rather than in the settings file.
+  -- Max batch decides whether a surplus drains or AE2 refuses the job, and
+  -- the CPU reserve decides whether a manual craft can still get in. Both
+  -- belong on screen rather than buried in the settings file.
   fg(C.label); gset(40, 2, "MAX BATCH")
   fg(C.craft)
-  if ui.acEditBatch then
-    gset(50, 2, ui.acBatchText .. "_")
-  else
-    gset(50, 2, comma(ac.maxBatch or 1000))
-  end
-  fg(C.label); gset(64, 2, "(M to edit)")
+  gset(50, 2, ui.acEdit == "maxBatch"
+    and (ui.acEditText .. "_") or comma(ac.maxBatch or 1000))
+  fg(C.label); gset(62, 2, "(M)")
+
+  fg(C.label); gset(68, 2, "RESERVE CPUS")
+  fg(C.craft)
+  gset(81, 2, ui.acEdit == "reserveCpus"
+    and (ui.acEditText .. "_") or tostring(ac.reserveCpus or 0))
+  fg(C.label); gset(85, 2, "(V)")
+
+  -- Live CPU picture, so the reserve number means something concrete.
+  fg(C.label)
+  gset(92, 2, string.format("%d idle of %d", math.max(0, #state.cpus - state.cpuBusy), #state.cpus))
 
   bg(C.bg); fg(C.border)
   gset(1, 4, "┌" .. string.rep("─", W - 2) .. "┐")
@@ -1116,8 +1184,8 @@ local function drawSettingsFooter()
     }
   else
     hints = {
-      {"j/k", "move"}, {"A", "add rule"}, {"Enter", "edit"}, {"Space", "on/off"},
-      {"D", "delete"}, {"E", "auto-craft"}, {"M", "max batch"},
+      {"j/k", "move"}, {"A", "add"}, {"Enter", "edit"}, {"Space", "on/off"},
+      {"D", "delete"}, {"E", "auto-craft"}, {"M", "max batch"}, {"V", "reserve"},
       {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
     }
   end
@@ -1466,33 +1534,36 @@ local function handleSettingsKey(char, code)
   -- action doesn't sit pinned to the footer while you scroll the list.
   ui.status = nil
 
-  -- Inline max-batch editor takes the keyboard while open.
-  if ui.acEditBatch then
+  -- Inline editor for a global number takes the keyboard while open.
+  if ui.acEdit then
+    local field = ui.acEdit
     if isCancel(code) then
-      ui.acEditBatch, ui.acBatchText = false, ""
+      ui.acEdit, ui.acEditText = nil, ""
     elseif code == KEY_ENTER then
-      local n = tonumber(ui.acBatchText)
-      if not n or n < 1 then
-        setStatus("max batch must be 1 or more", "bad")
+      local n = tonumber(ui.acEditText)
+      local floor = (field == "maxBatch") and 1 or 0   -- reserve may be zero
+      if not n or n < floor then
+        setStatus(field .. " must be " .. floor .. " or more", "bad")
       else
-        settings.autoCraft.maxBatch = math.floor(n)
+        settings.autoCraft[field] = math.floor(n)
         local ok, err = saveSettings(settings)
         setStatus(
-          ok and ("max batch set to " .. comma(math.floor(n)))
+          ok and (field .. " set to " .. comma(math.floor(n)))
               or ("changed but NOT saved to disk: " .. tostring(err)),
           ok and "good" or "bad"
         )
-        ui.acEditBatch, ui.acBatchText = false, ""
+        ui.acEdit, ui.acEditText = nil, ""
       end
     else
-      ui.acBatchText = editNumber(ui.acBatchText, char, code, 7)
+      ui.acEditText = editNumber(ui.acEditText, char, code, 7)
     end
     return
   end
 
-  if ch == "m" then
-    ui.acEditBatch = true
-    ui.acBatchText = tostring(settings.autoCraft.maxBatch or 1000)
+  if ch == "m" or ch == "v" then
+    local field = (ch == "m") and "maxBatch" or "reserveCpus"
+    ui.acEdit = field
+    ui.acEditText = tostring(settings.autoCraft[field] or 0)
     return
   end
 
