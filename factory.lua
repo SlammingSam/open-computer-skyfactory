@@ -93,28 +93,77 @@ local function mergeDefaults(loaded, defaults)
   return loaded
 end
 
-local function loadSettings()
-  if not serialization then return defaultSettings() end
-  local f = io.open(SETTINGS_PATH, "r")
-  if not f then return defaultSettings() end
+-- ------------------------------ durable writes ------------------------------
+-- A plain write() + close() is not atomic: losing power partway leaves a
+-- truncated file, unserialize fails, and everything silently reverts to
+-- defaults. Instead the new contents go to a temp file, are read back to
+-- prove they parse, and only then replace the live file — with the previous
+-- copy kept as .bak so there is always one good file on disk.
+
+local fsLib; pcall(function() fsLib = require("filesystem") end)
+
+local function readTable(path)
+  if not serialization then return nil end
+  local f = io.open(path, "r")
+  if not f then return nil end
   local raw = f:read("*a")
   f:close()
+  local ok, value = pcall(serialization.unserialize, raw)
+  if ok and type(value) == "table" then return value end
+  return nil
+end
 
-  local ok, loaded = pcall(serialization.unserialize, raw)
-  if not ok or type(loaded) ~= "table" then return defaultSettings() end
+-- Returns ok, warning. A warning means it was written but NOT atomically, so
+-- the caller can say so rather than implying a guarantee it didn't get.
+local function writeTableSafely(path, tbl)
+  if not serialization then return false, "serialization API not available" end
+  local ok, data = pcall(serialization.serialize, tbl)
+  if not ok then return false, tostring(data) end
+
+  local tmp, bak = path .. ".tmp", path .. ".bak"
+
+  local f, err = io.open(tmp, "w")
+  if not f then return false, "temp file: " .. tostring(err) end
+  f:write(data)
+  f:close()
+
+  -- Trust nothing that can't be read back.
+  if not readTable(tmp) then
+    return false, "temp file did not read back cleanly — live file untouched"
+  end
+
+  -- filesystem.rename may not exist on this bridge; fall back rather than fail.
+  if fsLib and fsLib.rename then
+    pcall(function() fsLib.remove(bak) end)
+    local movedAside = true
+    if fsLib.exists and fsLib.exists(path) then
+      local pok, rok = pcall(fsLib.rename, path, bak)
+      movedAside = pok and rok ~= false
+    end
+    local pok, rok, rerr = pcall(fsLib.rename, tmp, path)
+    if pok and rok ~= false then return true end
+    -- Swap failed: put the old file back so we don't end up with nothing.
+    if movedAside then pcall(fsLib.rename, bak, path) end
+    return false, "rename failed: " .. tostring(rerr or rok)
+  end
+
+  local d, derr = io.open(path, "w")
+  if not d then return false, tostring(derr) end
+  d:write(data)
+  d:close()
+  return true, "no filesystem.rename here — saved, but not atomically"
+end
+
+local function loadSettings()
+  if not serialization then return defaultSettings() end
+  -- Prefer the live file; fall back to the backup if it's missing or corrupt.
+  local loaded = readTable(SETTINGS_PATH) or readTable(SETTINGS_PATH .. ".bak")
+  if not loaded then return defaultSettings() end
   return mergeDefaults(loaded, defaultSettings())
 end
 
 local function saveSettings(s)
-  if not serialization then return false, "serialization API not available" end
-  local ok, serialized = pcall(serialization.serialize, s)
-  if not ok then return false, tostring(serialized) end
-
-  local f, err = io.open(SETTINGS_PATH, "w")
-  if not f then return false, tostring(err) end
-  f:write(serialized)
-  f:close()
-  return true
+  return writeTableSafely(SETTINGS_PATH, s)
 end
 
 local settings = loadSettings()
@@ -131,25 +180,11 @@ local LOG_MAX = 200        -- oldest entries are dropped past this
 local eventLog = {}        -- oldest first; newest is appended
 
 local function loadLog()
-  if not serialization then return {} end
-  local f = io.open(LOG_PATH, "r")
-  if not f then return {} end
-  local raw = f:read("*a")
-  f:close()
-  local ok, loaded = pcall(serialization.unserialize, raw)
-  if not ok or type(loaded) ~= "table" then return {} end
-  return loaded
+  return readTable(LOG_PATH) or readTable(LOG_PATH .. ".bak") or {}
 end
 
 local function saveLog()
-  if not serialization then return false, "serialization API not available" end
-  local ok, data = pcall(serialization.serialize, eventLog)
-  if not ok then return false, tostring(data) end
-  local f, err = io.open(LOG_PATH, "w")
-  if not f then return false, tostring(err) end
-  f:write(data)
-  f:close()
-  return true
+  return writeTableSafely(LOG_PATH, eventLog)
 end
 
 eventLog = loadLog()
@@ -218,6 +253,33 @@ local function fg(c) safeCall(gpuAddr, "setForeground", c) end
 local function bg(c) safeCall(gpuAddr, "setBackground", c) end
 local function gset(x, y, s) safeCall(gpuAddr, "set", x, y, s) end
 local function gfill(x, y, w, h, ch) safeCall(gpuAddr, "fill", x, y, w, h, ch) end
+
+-- ============================== touch regions ===============================
+-- Tier 2/3 screens are touch screens, so every control is tappable. Regions
+-- are rebuilt by each render pass as it draws, which means what is on screen
+-- and what responds to a tap cannot disagree. Most regions carry a simulated
+-- keypress rather than their own logic, so touch and keyboard always run the
+-- identical code path.
+
+local hits = {}
+
+local function clearHits() hits = {} end
+
+local function addHit(x, y, w, h, action, value)
+  hits[#hits + 1] = {
+    x1 = x, y1 = y, x2 = x + w - 1, y2 = y + h - 1,
+    action = action, value = value,
+  }
+end
+
+local function hitAt(x, y)
+  -- Reverse order: a control drawn over a row wins over the row beneath it.
+  for i = #hits, 1, -1 do
+    local h = hits[i]
+    if x >= h.x1 and x <= h.x2 and y >= h.y1 and y <= h.y2 then return h end
+  end
+  return nil
+end
 
 -- Truncate-or-pad to an exact display width (unicode-safe).
 local function fit(s, width)
@@ -905,6 +967,7 @@ local function drawList()
     gset(1, y, "│"); gset(W, y, "│")
 
     if it then
+      addHit(2, y, W - 2, 1, "select", idx)   -- tap a row to select it
       bg(rowBg)
       fg(selected and C.accent or C.border)
       gset(3, y, selected and "▸ " or "  ")
@@ -975,6 +1038,32 @@ local function drawList()
   fg(C.label); gset(2 + dashes, H - 1, info)
 end
 
+-- Draws the footer as a row of buttons. Each entry is {key, description,
+-- press}, where `press` is the keystroke a tap should simulate — so a tap and
+-- the matching key are literally the same action. Entries without a press are
+-- drawn as plain labels.
+local function drawHintBar(entries)
+  local x = 2
+  for _, e in ipairs(entries) do
+    local key, desc, press = e[1], e[2], e[3]
+    local chip = " " .. key .. " "
+    local width = ulen(chip) + (desc ~= "" and (1 + ulen(desc)) or 0)
+
+    if x + width > W then break end        -- ran out of room; stop cleanly
+
+    bg(press and C.selBg or C.bg)
+    fg(C.accent); gset(x, H, chip)
+    bg(C.bg)
+    if desc ~= "" then
+      fg(C.label); gset(x + ulen(chip) + 1, H, desc)
+    end
+    if press then addHit(x, H, width, 1, "key", press) end
+
+    x = x + width + 2
+  end
+  bg(C.bg)
+end
+
 local function drawFooter()
   bg(C.bg); gfill(1, H, W, 1, " ")
 
@@ -1024,16 +1113,18 @@ local function drawFooter()
     return
   end
 
-  -- Keybinding hints: keys in accent, descriptions dim.
-  local hints = {
-    {"R", "refresh"}, {"j/k", "move"}, {"/", "filter"}, {"S", "sort"},
-    {"C", "craft"}, {"A", "auto-craft"}, {"O", "settings"}, {CANCEL_HINT, "clear"}, {"Q", "quit"},
-  }
-  local x = 2
-  for _, h in ipairs(hints) do
-    fg(C.accent); gset(x, H, h[1]); x = x + ulen(h[1]) + 1
-    fg(C.label);  gset(x, H, h[2]); x = x + ulen(h[2]) + 3
-  end
+  drawHintBar({
+    {"▲", "", {code = KEY_UP}},
+    {"▼", "", {code = KEY_DOWN}},
+    {"R", "refresh",  {char = string.byte("r")}},
+    {"/", "filter",   {char = string.byte("/")}},
+    {"S", "sort",     {char = string.byte("s")}},
+    {"C", "craft",    {char = string.byte("c")}},
+    {"A", "auto",     {char = string.byte("a")}},
+    {"O", "settings", {char = string.byte("o")}},
+    {CANCEL_HINT, "clear", {code = KEY_CANCEL}},
+    {"Q", "quit",     {char = string.byte("q")}},
+  })
 end
 
 -- =============================== settings page ===============================
@@ -1051,6 +1142,7 @@ local function drawSettingsHeader()
     fg(i == ui.settingsTab and C.selFg or C.label)
     bg(i == ui.settingsTab and C.selBg or C.headerBg)
     gset(x, 1, label)
+    addHit(x, 1, ulen(label), 1, "tab", i)
     x = x - 1
   end
   bg(C.headerBg)
@@ -1105,11 +1197,14 @@ local function drawAutoCraftTab()
   local x = 2
 
   local function seg(label, value, valueColor, keyHint)
+    local startX = x
     fg(C.label); gset(x, 2, label); x = x + ulen(label) + 1
     fg(valueColor or C.craft); gset(x, 2, value); x = x + ulen(value) + 1
     if keyHint then
       local k = "(" .. keyHint .. ")"
       fg(C.label); gset(x, 2, k); x = x + ulen(k) + 3
+      -- The whole segment is tappable, not just the key hint.
+      addHit(startX, 2, x - startX, 1, "key", {char = string.byte(keyHint:lower())})
     else
       x = x + 2
     end
@@ -1167,6 +1262,10 @@ local function drawAutoCraftTab()
     fg(C.border); bg(C.bg); gset(1, y, "│"); gset(W, y, "│")
 
     if rule then
+      -- Tap the row to select it; tap its STATE cell to flip it on or off.
+      addHit(2, y, W - 2, 1, "acSelect", idx)
+      addHit(c.xState - 1, y, 6, 1, "acToggle", idx)
+
       bg(rowBg)
       fg(selected and C.accent or C.border)
       gset(3, y, selected and "▸ " or "  ")
@@ -1269,6 +1368,10 @@ local function drawRuleForm()
   for i, id in ipairs(fields) do
     local y = 6 + i - 1
     local selected = (i == ui.form.field)
+
+    -- Tapping a field does the obvious thing for its type: a choice flips, an
+    -- item field opens the picker, a number just gets selected for typing.
+    addHit(2, y, W - 2, 1, "formTap", i)
 
     fg(selected and C.accent or C.border)
     gset(4, y, selected and "▸" or " ")
@@ -1392,36 +1495,54 @@ local function drawSettingsFooter()
     return
   end
 
-  local hints
   if ui.form.active then
-    hints = {
-      {"j/k", "field"}, {"type", "number"}, {"←/→", "change"},
-      {"P", "pick item"}, {"Enter", "save"}, {CANCEL_HINT, "cancel"},
-    }
-  elseif ui.logFilterMode then
+    drawHintBar({
+      {"▲", "", {code = KEY_UP}},
+      {"▼", "", {code = KEY_DOWN}},
+      {"◀", "", {code = KEY_LEFT}},
+      {"▶", "change", {code = KEY_RIGHT}},
+      {"P", "pick item", {char = string.byte("p")}},
+      {"Enter", "save",  {code = KEY_ENTER}},
+      {CANCEL_HINT, "cancel", {code = KEY_CANCEL}},
+    })
+    return
+  end
+
+  if ui.logFilterMode then
     fg(C.accent); gset(2, H, "SEARCH ")
     fg(C.selFg);  gset(9, H, ui.logFilter .. "_")
     fg(C.label)
     local hint = "Enter accept · Backspace edit · " .. CANCEL_HINT .. " clear"
     gset(W - ulen(hint) - 1, H, hint)
     return
-  elseif SETTINGS_TABS[ui.settingsTab] == "Log" then
-    hints = {
-      {"Tab", "tab"}, {"j/k", "scroll"}, {"/", "search"},
-      {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
-    }
-  else
-    hints = {
-      {"Tab", "tab"}, {"j/k", "move"}, {"A", "add"}, {"Enter", "edit"},
-      {"Space", "on/off"}, {"D", "delete"}, {"E", "on"}, {"M", "batch"},
-      {"V", "reserve"}, {"I", "interval"}, {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
-    }
   end
-  local x = 2
-  for _, h in ipairs(hints) do
-    fg(C.accent); gset(x, H, h[1]); x = x + ulen(h[1]) + 1
-    fg(C.label);  gset(x, H, h[2]); x = x + ulen(h[2]) + 3
+
+  if SETTINGS_TABS[ui.settingsTab] == "Log" then
+    drawHintBar({
+      {"▲", "", {code = KEY_UP}},
+      {"▼", "", {code = KEY_DOWN}},
+      {"Tab", "tab",    {code = KEY_TAB}},
+      {"/", "search",   {char = string.byte("/")}},
+      {"O", "back",     {char = string.byte("o")}},
+      {"Q", "quit",     {char = string.byte("q")}},
+    })
+    return
   end
+
+  drawHintBar({
+    {"▲", "", {code = KEY_UP}},
+    {"▼", "", {code = KEY_DOWN}},
+    {"Tab", "tab",     {code = KEY_TAB}},
+    {"A", "add",       {char = string.byte("a")}},
+    {"Enter", "edit",  {code = KEY_ENTER}},
+    {"D", "delete",    {char = string.byte("d")}},
+    {"E", "on/off",    {char = string.byte("e")}},
+    {"M", "batch",     {char = string.byte("m")}},
+    {"V", "reserve",   {char = string.byte("v")}},
+    {"I", "interval",  {char = string.byte("i")}},
+    {"O", "back",      {char = string.byte("o")}},
+    {"Q", "quit",      {char = string.byte("q")}},
+  })
 end
 
 local function renderSettings()
@@ -1440,6 +1561,10 @@ end
 -- ================================= render ====================================
 
 local function render()
+  -- Touch regions belong to the frame being drawn, so they start empty and
+  -- are rebuilt by whatever this pass actually puts on screen.
+  clearHits()
+
   if ui.page == "settings" then
     renderSettings()
     return
@@ -1966,6 +2091,40 @@ local function handleKey(char, code)
   end
 end
 
+-- Routes a tap to whatever was drawn under it. Most regions simply replay a
+-- keystroke, so a tapped control and its key shortcut are the same code path
+-- and can never diverge.
+local function handleTouch(x, y)
+  local h = hitAt(x, y)
+  if not h then return end
+
+  if h.action == "key" then
+    return handleKey(h.value.char, h.value.code)
+
+  elseif h.action == "select" then
+    ui.selected = h.value
+
+  elseif h.action == "tab" then
+    ui.settingsTab = h.value
+
+  elseif h.action == "acSelect" then
+    ui.acSelected = h.value
+
+  elseif h.action == "acToggle" then
+    ui.acSelected = h.value
+    return handleKey(32, nil)              -- Space toggles the rule
+
+  elseif h.action == "formTap" then
+    ui.form.field = h.value
+    local id = formFields()[h.value]
+    if id == "type" or id == "enabled" then
+      return handleKey(nil, KEY_RIGHT)
+    elseif id == "watch" or id == "craft" then
+      return handleKey(string.byte("p"), nil)
+    end
+  end
+end
+
 -- ================================ main loop =================================
 
 local function setup()
@@ -2001,9 +2160,20 @@ local function main()
 
   local lastRefresh = computer.uptime()
   while true do
-    local e, _, char, code = event.pull(3, "key_down")
+    -- Pull every event rather than just key_down, so touch and scroll work.
+    -- Argument meaning differs per event: key_down gives (char, code),
+    -- touch gives (x, y, button), scroll gives (x, y, direction).
+    local e, _, p1, p2, p3 = event.pull(3)
+
     if e == "key_down" then
-      if handleKey(char, code) == "quit" then break end
+      if handleKey(p1, p2) == "quit" then break end
+
+    elseif e == "touch" then
+      if handleTouch(p1, p2) == "quit" then break end
+
+    elseif e == "scroll" then
+      -- Every page already handles up/down, so the wheel comes for free.
+      if handleKey(nil, (p3 or 0) > 0 and KEY_UP or KEY_DOWN) == "quit" then break end
     end
 
     if computer.uptime() - lastRefresh >= 3 then
