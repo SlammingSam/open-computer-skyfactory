@@ -119,6 +119,56 @@ end
 
 local settings = loadSettings()
 
+-- ================================ event log =================================
+-- Auto-crafting runs while nobody is watching, and both the footer status and
+-- the JOBS row are transient — so without a durable record there is no way to
+-- answer "what did this do overnight, and did any of it fail?". Kept in its
+-- own file so a long log can never threaten the settings file.
+
+local LOG_PATH = "/home/.factory_log.cfg"
+local LOG_MAX = 200        -- oldest entries are dropped past this
+
+local eventLog = {}        -- oldest first; newest is appended
+
+local function loadLog()
+  if not serialization then return {} end
+  local f = io.open(LOG_PATH, "r")
+  if not f then return {} end
+  local raw = f:read("*a")
+  f:close()
+  local ok, loaded = pcall(serialization.unserialize, raw)
+  if not ok or type(loaded) ~= "table" then return {} end
+  return loaded
+end
+
+local function saveLog()
+  if not serialization then return false, "serialization API not available" end
+  local ok, data = pcall(serialization.serialize, eventLog)
+  if not ok then return false, tostring(data) end
+  local f, err = io.open(LOG_PATH, "w")
+  if not f then return false, tostring(err) end
+  f:write(data)
+  f:close()
+  return true
+end
+
+eventLog = loadLog()
+
+-- kind: dispatch | done | cancel | fail | pause | manual
+local function logEvent(kind, label, qty, detail)
+  local stamp = "--"
+  pcall(function() stamp = os.date("%m-%d %H:%M:%S") end)
+
+  eventLog[#eventLog + 1] = {
+    stamp = stamp, kind = kind,
+    label = tostring(label or "?"),
+    qty = tonumber(qty) or 0,
+    detail = detail and tostring(detail) or nil,
+  }
+  while #eventLog > LOG_MAX do table.remove(eventLog, 1) end
+  saveLog()
+end
+
 -- ================================= palette ==================================
 
 local C = {
@@ -361,6 +411,12 @@ local function pollJobs()
   for _, job in ipairs(state.jobs) do
     if job.status ~= "done" and job.status ~= "canceled" and job.status ~= "unreadable" then
       pollJob(job)
+      -- Log the transition once, the moment a job resolves — pollJob only
+      -- sets endedAt on that first resolving pass.
+      if job.status == "done" or job.status == "canceled" or job.status == "unreadable" then
+        logEvent(job.status == "done" and "done" or "cancel", job.label, job.qty,
+                 job.auto and "auto" or "manual")
+      end
     end
     -- Retire finished jobs after a grace period so the outcome stays visible.
     if not job.endedAt or computer.uptime() - job.endedAt < JOB_KEEP_SECONDS then
@@ -370,7 +426,9 @@ local function pollJobs()
   state.jobs = keep
 end
 
-local function requestCraft(entry, qty, label)
+-- `auto` marks jobs started by a rule rather than by hand, so the log can
+-- tell them apart.
+local function requestCraft(entry, qty, label, auto)
   if not CRAFT_CONFIRMED then
     return false, "crafting locked — run diag_craft2.lua first"
   end
@@ -386,7 +444,7 @@ local function requestCraft(entry, qty, label)
 
   -- Keep the handle. Do NOT interpret it yet: the plan has not been computed.
   local job = {
-    label = label or "?", qty = qty, obj = result,
+    label = label or "?", qty = qty, obj = result, auto = auto or nil,
     startedAt = computer.uptime(), status = "computing",
   }
   state.jobs[#state.jobs + 1] = job
@@ -444,6 +502,9 @@ local ui = {
   -- "reserveCpus". One mechanism rather than a flag per setting.
   acEdit = nil, acEditText = "",
 
+  logTop = 1,                            -- first visible log row
+  logFilter = "", logFilterMode = false, -- search over the event log
+
   -- Rule editor. One form serves both "add" and "edit": every field is on
   -- screen at once and editable in any order, rather than a blind sequence of
   -- prompts you can't review or revise. `index` is the rules[] slot being
@@ -459,7 +520,7 @@ local ui = {
   },
 }
 
-local SETTINGS_TABS = {"Auto-Craft"}  -- more tabs can be appended here later
+local SETTINGS_TABS = {"Auto-Craft", "Log"}
 
 -- Editable global auto-craft numbers: which key opens each, and the lowest
 -- value each will accept. A reserve of zero is legitimate; a batch size or a
@@ -601,6 +662,8 @@ local function evaluateAutoCraft()
           if not since and recentlyCancelled(label) then
             state.autoCraftBackoff[fireKey] = computer.uptime()
             since = computer.uptime()
+            logEvent("pause", label, 0,
+                     "cancelled job; backing off " .. AUTO_CRAFT_RETRY_SECONDS .. "s")
             setStatus("auto-craft paused for " .. label
                       .. ": last job was cancelled — try a smaller max batch", "bad")
           end
@@ -615,11 +678,13 @@ local function evaluateAutoCraft()
         if entry and needed and needed >= 1 and not backingOff
            and quantityInFlight(label) == 0 then
           local batch = math.min(needed, maxBatch)
-          local ok, result = requestCraft(entry, batch, label)
+          local ok, result = requestCraft(entry, batch, label, true)
           if ok then
             budget = budget - 1
+            logEvent("dispatch", label, batch, rule.label .. " " .. rule.direction)
             setStatus("auto-craft: " .. label .. " x" .. comma(batch), "info")
           else
+            logEvent("fail", label, batch, tostring(result))
             setStatus("auto-craft failed: " .. label .. " - " .. tostring(result), "bad")
           end
         end
@@ -636,6 +701,7 @@ local KEY_ENTER, KEY_BACK, KEY_ESC = 28, 14, 1
 local KEY_UP, KEY_DOWN, KEY_PGUP, KEY_PGDN = 200, 208, 201, 209
 local KEY_HOME, KEY_END = 199, 207
 local KEY_LEFT, KEY_RIGHT = 203, 205
+local KEY_TAB = 15
 
 -- Minecraft swallows Esc before the screen ever receives it (it closes the
 -- GUI), so cancel/back is bound to Delete. Esc is still honoured for setups
@@ -1219,6 +1285,99 @@ local function drawRuleForm()
   end
 end
 
+-- ================================= log tab ==================================
+
+local LOG_KIND_COLOR = {
+  dispatch = C.accent, done = C.good, cancel = C.bad,
+  fail = C.bad, pause = C.warn, manual = C.text,
+}
+
+-- Newest first, narrowed by the search text. Matching is a plain substring
+-- over every displayed field, so "cancel", "Steel" and "09-12" all work
+-- without the user needing to know which column they're searching.
+local function filteredLog()
+  local needle = ui.logFilter:lower()
+  local out = {}
+  for i = #eventLog, 1, -1 do
+    local e = eventLog[i]
+    if needle == ""
+       or e.label:lower():find(needle, 1, true)
+       or e.kind:lower():find(needle, 1, true)
+       or e.stamp:lower():find(needle, 1, true)
+       or (e.detail and e.detail:lower():find(needle, 1, true)) then
+      out[#out + 1] = e
+    end
+  end
+  return out
+end
+
+local function drawLogTab()
+  bg(C.bg); gfill(1, 2, W, 1, " ")
+  fg(C.label); gset(2, 2, "EVENT LOG")
+  fg(C.text); gset(12, 2, comma(#eventLog) .. " of " .. comma(LOG_MAX) .. " kept")
+
+  if ui.logFilterMode or ui.logFilter ~= "" then
+    fg(C.accent); gset(32, 2, "SEARCH ")
+    fg(C.selFg)
+    gset(39, 2, ui.logFilter .. (ui.logFilterMode and "_" or ""))
+  else
+    fg(C.label); gset(32, 2, "(/ to search)")
+  end
+
+  local xTime, xKind, xItem, xQty = 3, 14, 24, 0
+  local wItem = math.max(14, math.min(34, math.floor(W * 0.24)))
+  xQty = xItem + wItem + 2
+  local xDetail = xQty + 10
+  local wDetail = math.max(6, W - xDetail - 2)
+
+  bg(C.bg); fg(C.border)
+  gset(1, 4, "┌" .. string.rep("─", W - 2) .. "┐")
+  gfill(1, 5, W, 1, " ")
+  gset(1, 5, "│"); gset(W, 5, "│")
+  fg(C.label)
+  gset(xTime, 5, "TIME")
+  gset(xKind, 5, "EVENT")
+  gset(xItem, 5, fit("ITEM", wItem))
+  gset(xQty, 5, ralign("QTY", 8))
+  gset(xDetail, 5, fit("DETAIL", wDetail))
+  fg(C.border)
+  gset(1, 6, "├" .. string.rep("─", W - 2) .. "┤")
+
+  local entries = filteredLog()
+  local rows = math.max(1, H - 9)
+  if ui.logTop > #entries then ui.logTop = math.max(1, #entries) end
+  if ui.logTop < 1 then ui.logTop = 1 end
+
+  for r = 0, rows - 1 do
+    local y = 7 + r
+    local e = entries[ui.logTop + r]
+
+    bg(C.bg); gfill(2, y, W - 2, 1, " ")
+    fg(C.border); gset(1, y, "│"); gset(W, y, "│")
+
+    if e then
+      fg(C.label); gset(xTime, y, e.stamp)
+      fg(LOG_KIND_COLOR[e.kind] or C.text); gset(xKind, y, fit(e.kind, 9))
+      fg(C.text); gset(xItem, y, fit(e.label, wItem))
+      fg(C.craft); gset(xQty, y, ralign(e.qty > 0 and comma(e.qty) or "", 8))
+      if e.detail then
+        fg(C.zero); gset(xDetail, y, fit(e.detail, wDetail))
+      end
+    end
+  end
+
+  bg(C.bg); fg(C.border)
+  gset(1, 7 + rows, "└" .. string.rep("─", W - 2) .. "┘")
+
+  if #entries == 0 then
+    fg(C.zero)
+    local msg = ui.logFilter ~= ""
+      and ("nothing in the log matches \"" .. ui.logFilter .. "\"")
+      or "nothing logged yet"
+    gset(math.max(1, math.floor((W - ulen(msg)) / 2)), 9, msg)
+  end
+end
+
 local function drawSettingsFooter()
   bg(C.bg); gfill(1, H, W, 1, " ")
 
@@ -1239,11 +1398,23 @@ local function drawSettingsFooter()
       {"j/k", "field"}, {"type", "number"}, {"←/→", "change"},
       {"P", "pick item"}, {"Enter", "save"}, {CANCEL_HINT, "cancel"},
     }
+  elseif ui.logFilterMode then
+    fg(C.accent); gset(2, H, "SEARCH ")
+    fg(C.selFg);  gset(9, H, ui.logFilter .. "_")
+    fg(C.label)
+    local hint = "Enter accept · Backspace edit · " .. CANCEL_HINT .. " clear"
+    gset(W - ulen(hint) - 1, H, hint)
+    return
+  elseif SETTINGS_TABS[ui.settingsTab] == "Log" then
+    hints = {
+      {"Tab", "tab"}, {"j/k", "scroll"}, {"/", "search"},
+      {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
+    }
   else
     hints = {
-      {"j/k", "move"}, {"A", "add"}, {"Enter", "edit"}, {"Space", "on/off"},
-      {"D", "delete"}, {"E", "on"}, {"M", "batch"}, {"V", "reserve"},
-      {"I", "interval"}, {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
+      {"Tab", "tab"}, {"j/k", "move"}, {"A", "add"}, {"Enter", "edit"},
+      {"Space", "on/off"}, {"D", "delete"}, {"E", "on"}, {"M", "batch"},
+      {"V", "reserve"}, {"I", "interval"}, {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
     }
   end
   local x = 2
@@ -1258,6 +1429,8 @@ local function renderSettings()
   drawSettingsHeader()
   if ui.form.active then
     drawRuleForm()
+  elseif SETTINGS_TABS[ui.settingsTab] == "Log" then
+    drawLogTab()
   else
     drawAutoCraftTab()
   end
@@ -1584,12 +1757,66 @@ local function handleRuleFormKey(char, code)
   end
 end
 
+-- Search box on the log tab. Kept separate from the dashboard's filter so the
+-- two don't share state — searching the log shouldn't disturb the storage view.
+local function handleLogFilterKey(char, code)
+  if code == KEY_ENTER then
+    ui.logFilterMode = false
+  elseif isCancel(code) then
+    ui.logFilterMode, ui.logFilter = false, ""
+    ui.logTop = 1
+  elseif code == KEY_BACK then
+    ui.logFilter = usub(ui.logFilter, 1, math.max(0, ulen(ui.logFilter) - 1))
+    ui.logTop = 1
+  elseif char and char >= 32 and char < 127 then
+    ui.logFilter = ui.logFilter .. string.char(char)
+    ui.logTop = 1
+  end
+end
+
+local function handleLogKey(char, code)
+  local ch = (char and char > 0) and string.char(char):lower() or ""
+  local rows = math.max(1, H - 9)
+  local total = #filteredLog()
+
+  if ch == "/" then
+    ui.logFilterMode = true
+  elseif ch == "j" or code == KEY_DOWN then
+    ui.logTop = math.min(math.max(1, total - rows + 1), ui.logTop + 1)
+  elseif ch == "k" or code == KEY_UP then
+    ui.logTop = math.max(1, ui.logTop - 1)
+  elseif code == KEY_PGDN then
+    ui.logTop = math.min(math.max(1, total - rows + 1), ui.logTop + rows)
+  elseif code == KEY_PGUP then
+    ui.logTop = math.max(1, ui.logTop - rows)
+  elseif code == KEY_HOME then
+    ui.logTop = 1
+  elseif code == KEY_END then
+    ui.logTop = math.max(1, total - rows + 1)
+  end
+end
+
 local function handleSettingsKey(char, code)
   local ch = (char and char > 0) and string.char(char):lower() or ""
   local rules = settings.autoCraft.rules
   -- Cleared per keypress like the dashboard does, so a message from the last
   -- action doesn't sit pinned to the footer while you scroll the list.
   ui.status = nil
+
+  if ui.logFilterMode then return handleLogFilterKey(char, code) end
+
+  if code == KEY_TAB then
+    ui.settingsTab = (ui.settingsTab % #SETTINGS_TABS) + 1
+    return
+  end
+
+  -- The log tab shares only quit/back with the rule tab; everything else
+  -- there (add, delete, the global editors) would be meaningless.
+  if SETTINGS_TABS[ui.settingsTab] == "Log" then
+    if ch == "q" then return "quit" end
+    if ch == "o" or isCancel(code) then ui.page = "dashboard" return end
+    return handleLogKey(char, code)
+  end
 
   -- Inline editor for a global number takes the keyboard while open.
   if ui.acEdit then
