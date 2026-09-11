@@ -461,6 +461,12 @@ local ui = {
 
 local SETTINGS_TABS = {"Auto-Craft"}  -- more tabs can be appended here later
 
+-- Editable global auto-craft numbers: which key opens each, and the lowest
+-- value each will accept. A reserve of zero is legitimate; a batch size or a
+-- check interval of zero is not.
+local AC_GLOBAL_KEYS = {m = "maxBatch", v = "reserveCpus", i = "checkSeconds"}
+local AC_GLOBAL_MIN  = {maxBatch = 1, reserveCpus = 0, checkSeconds = 1}
+
 local function setStatus(msg, kind)
   ui.status = msg
   ui.statusKind = kind or "info"
@@ -543,6 +549,12 @@ end
 local function evaluateAutoCraft()
   local ac = settings.autoCraft
   if not ac.enabled then return end
+
+  -- Never act on a failed read. When getItemsInNetwork() fails, refresh()
+  -- rebuilds the list from the craftable catalogue alone and every entry
+  -- reads as count 0 — which every "below" rule would treat as "stock is
+  -- empty, craft now" and fire spuriously on a transient ME hiccup.
+  if not state.lastOk then return end
 
   local interval = tonumber(ac.checkSeconds) or 15
   if state.autoCraftCheckedAt and computer.uptime() - state.autoCraftCheckedAt < interval then
@@ -726,6 +738,22 @@ local function columns()
   return c
 end
 
+-- Whether an item is involved in any enabled auto-craft rule, and how:
+-- watched by one, produced by one, or neither. Drives the storage list's tag
+-- column so automation is visible from the dashboard rather than only on the
+-- settings page.
+local function autoCraftRoleOf(key)
+  if not key then return nil, nil end
+  local watched, produced = false, false
+  for _, rule in ipairs(settings.autoCraft.rules) do
+    if rule.enabled then
+      if rule.key == key then watched = true end
+      if rule.craftKey == key then produced = true end
+    end
+  end
+  return watched or nil, produced or nil
+end
+
 -- Log scale: an ME network spans single items to seven-figure cobblestone,
 -- so a linear bar would render everything but the largest stack as empty.
 local function barFrac(v, maxv)
@@ -830,9 +858,16 @@ local function drawList()
         gset(c.xBar + filled, y, string.rep("·", c.bar - filled))
       end
 
-      if it.craftEntry then
-        fg(C.craft)
-        gset(c.xTag, y, "✦ craft")
+      -- Automation beats craftability in the tag column: knowing an item is
+      -- driven by a rule is more useful than knowing it has a recipe, and
+      -- anything under a rule is craftable anyway.
+      local watchedBy, producedBy = autoCraftRoleOf(it.key)
+      if watchedBy then
+        fg(C.accent); gset(c.xTag, y, "⚙ watch")
+      elseif producedBy then
+        fg(C.accent); gset(c.xTag, y, "⚙ make")
+      elseif it.craftEntry then
+        fg(C.craft); gset(c.xTag, y, "✦ craft")
       end
     end
   end
@@ -959,14 +994,29 @@ end
 -- header and its rows can't drift apart and a narrow screen still lines up.
 local function acColumns()
   local c = {}
-  c.xItem  = 5
-  c.wItem  = math.max(12, math.min(30, math.floor(W * 0.22)))
-  c.xWhen  = c.xItem + c.wItem + 2
-  c.wWhen  = 13
-  c.xAct   = c.xWhen + c.wWhen + 2
-  c.xState = W - 5
-  c.wAct   = math.max(8, c.xState - c.xAct - 2)
+  c.xItem   = 5
+  c.wItem   = math.max(12, math.min(30, math.floor(W * 0.22)))
+  c.xStock  = c.xItem + c.wItem + 2
+  c.wStock  = 11
+  c.xWhen   = c.xStock + c.wStock + 2
+  c.wWhen   = 13
+  c.xAct    = c.xWhen + c.wWhen + 2
+  c.xState  = W - 5
+  c.wAct    = math.max(8, c.xState - c.xAct - 2)
   return c
+end
+
+-- Current stock of a rule's watched item, and whether that stock is over the
+-- line right now. Shown per row so it's obvious at a glance which rules are
+-- about to fire and which are dormant, without cross-referencing the
+-- storage list.
+local function ruleStock(rule)
+  local watched = findItemByKey(rule.key)
+  if not watched then return nil, false end
+  local threshold = tonumber(rule.threshold) or 0
+  local triggered = (rule.direction == "below")
+    and (watched.count < threshold) or (rule.direction ~= "below" and watched.count > threshold)
+  return watched.count, triggered
 end
 
 -- One-line description of what a rule actually does when it fires.
@@ -983,30 +1033,37 @@ local function drawAutoCraftTab()
   local ac = settings.autoCraft
   local c = acColumns()
 
+  -- Globals laid out left to right from running positions rather than fixed
+  -- columns, so adding another one later doesn't mean re-measuring the row.
   bg(C.bg); gfill(1, 2, W, 1, " ")
-  fg(C.label); gset(2, 2, "AUTO-CRAFT")
-  fg(ac.enabled and C.good or C.bad)
-  gset(13, 2, ac.enabled and "● ENABLED" or "● DISABLED")
-  fg(C.label); gset(24, 2, "(E to toggle)")
+  local x = 2
 
-  -- Max batch decides whether a surplus drains or AE2 refuses the job, and
-  -- the CPU reserve decides whether a manual craft can still get in. Both
-  -- belong on screen rather than buried in the settings file.
-  fg(C.label); gset(40, 2, "MAX BATCH")
-  fg(C.craft)
-  gset(50, 2, ui.acEdit == "maxBatch"
-    and (ui.acEditText .. "_") or comma(ac.maxBatch or 1000))
-  fg(C.label); gset(62, 2, "(M)")
+  local function seg(label, value, valueColor, keyHint)
+    fg(C.label); gset(x, 2, label); x = x + ulen(label) + 1
+    fg(valueColor or C.craft); gset(x, 2, value); x = x + ulen(value) + 1
+    if keyHint then
+      local k = "(" .. keyHint .. ")"
+      fg(C.label); gset(x, 2, k); x = x + ulen(k) + 3
+    else
+      x = x + 2
+    end
+  end
 
-  fg(C.label); gset(68, 2, "RESERVE CPUS")
-  fg(C.craft)
-  gset(81, 2, ui.acEdit == "reserveCpus"
-    and (ui.acEditText .. "_") or tostring(ac.reserveCpus or 0))
-  fg(C.label); gset(85, 2, "(V)")
+  -- A field being edited shows its buffer with a caret instead of the value.
+  local function globalValue(field, shown)
+    if ui.acEdit == field then return ui.acEditText .. "_" end
+    return shown
+  end
+
+  seg("AUTO-CRAFT", ac.enabled and "● ENABLED" or "● DISABLED",
+      ac.enabled and C.good or C.bad, "E")
+  seg("MAX BATCH", globalValue("maxBatch", comma(ac.maxBatch or 1000)), C.craft, "M")
+  seg("RESERVE CPUS", globalValue("reserveCpus", tostring(ac.reserveCpus or 0)), C.craft, "V")
+  seg("CHECK EVERY", globalValue("checkSeconds", tostring(ac.checkSeconds or 15) .. "s"), C.craft, "I")
 
   -- Live CPU picture, so the reserve number means something concrete.
-  fg(C.label)
-  gset(92, 2, string.format("%d idle of %d", math.max(0, #state.cpus - state.cpuBusy), #state.cpus))
+  seg("CPUS", string.format("%d idle of %d",
+    math.max(0, #state.cpus - state.cpuBusy), #state.cpus), C.text)
 
   bg(C.bg); fg(C.border)
   gset(1, 4, "┌" .. string.rep("─", W - 2) .. "┐")
@@ -1014,6 +1071,7 @@ local function drawAutoCraftTab()
   gset(1, 5, "│"); gset(W, 5, "│")
   fg(C.label)
   gset(c.xItem, 5, fit("WATCH", c.wItem))
+  gset(c.xStock, 5, ralign("STOCK", c.wStock))
   gset(c.xWhen, 5, fit("WHEN", c.wWhen))
   gset(c.xAct,  5, fit("ACTION", c.wAct))
   gset(c.xState, 5, "STATE")
@@ -1048,6 +1106,13 @@ local function drawAutoCraftTab()
       gset(3, y, selected and "▸ " or "  ")
       fg(selected and C.selFg or C.text)
       gset(c.xItem, y, fit(rule.label, c.wItem))
+
+      -- Stock in warning colour while the rule is over its line, so a row
+      -- that is about to fire stands out from one that is merely configured.
+      local count, triggered = ruleStock(rule)
+      fg(count == nil and C.zero or (triggered and C.warn or C.text))
+      gset(c.xStock, y, ralign(count and comma(count) or "—", c.wStock))
+
       fg(C.label)
       gset(c.xWhen, y, fit(
         (rule.direction == "below" and "< " or "> ") .. comma(rule.threshold), c.wWhen))
@@ -1177,8 +1242,8 @@ local function drawSettingsFooter()
   else
     hints = {
       {"j/k", "move"}, {"A", "add"}, {"Enter", "edit"}, {"Space", "on/off"},
-      {"D", "delete"}, {"E", "auto-craft"}, {"M", "max batch"}, {"V", "reserve"},
-      {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
+      {"D", "delete"}, {"E", "on"}, {"M", "batch"}, {"V", "reserve"},
+      {"I", "interval"}, {"O/" .. CANCEL_HINT, "back"}, {"Q", "quit"},
     }
   end
   local x = 2
@@ -1533,7 +1598,7 @@ local function handleSettingsKey(char, code)
       ui.acEdit, ui.acEditText = nil, ""
     elseif code == KEY_ENTER then
       local n = tonumber(ui.acEditText)
-      local floor = (field == "maxBatch") and 1 or 0   -- reserve may be zero
+      local floor = AC_GLOBAL_MIN[field] or 0
       if not n or n < floor then
         setStatus(field .. " must be " .. floor .. " or more", "bad")
       else
@@ -1552,10 +1617,10 @@ local function handleSettingsKey(char, code)
     return
   end
 
-  if ch == "m" or ch == "v" then
-    local field = (ch == "m") and "maxBatch" or "reserveCpus"
-    ui.acEdit = field
-    ui.acEditText = tostring(settings.autoCraft[field] or 0)
+  local editField = AC_GLOBAL_KEYS[ch]
+  if editField then
+    ui.acEdit = editField
+    ui.acEditText = tostring(settings.autoCraft[editField] or 0)
     return
   end
 
