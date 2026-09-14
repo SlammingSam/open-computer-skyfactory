@@ -56,6 +56,7 @@ PRELUDE = r"""
 _G.__lastRequest = nil
 _G.__replies = {}
 _G.__replyIndex = 0
+_G.__fsfiles = {}
 
 local fakeHttp = {
   post = function(url, payload, headers)
@@ -78,15 +79,16 @@ local stubs = {
   computer  = { uptime = function() return 0 end },
   term      = { clear = function() end, setCursor = function() end },
   unicode   = { len = string.len, sub = string.sub },
-  filesystem = { exists = function() return false end,
-                 isDirectory = function() return false end,
+  filesystem = { exists = function(p) return _G.__fsfiles[p] ~= nil end,
+                 isDirectory = function(p) return _G.__fsfiles[p] == "dir" end,
                  list = function() return function() return nil end end,
                  size = function() return 0 end,
-                 remove = function() end,
+                 remove = function(p) _G.__fsfiles[p] = nil; return true end,
                  makeDirectory = function() end,
                  canonical = function(p) return p end },
   shell     = { getWorkingDirectory = function() return "/home" end,
-                execute = function() return true end },
+                execute = function() if _G.__shellok == false then return false end
+                                     return true end },
 }
 
 local realRequire = require
@@ -150,11 +152,13 @@ enc = j.encode(tools)
 check("tools use OpenAI 'parameters' key, not Anthropic 'input_schema'",
       '"parameters"' in enc and "input_schema" not in enc)
 check("every tool is wrapped in type=function",
-      enc.count('"type":"function"') == 5, enc.count('"type":"function"'))
-names = sorted(tools[i]["function"]["name"] for i in range(1, 6))
-check("five tools present",
-      names == ["list_files", "read_file", "run_command", "search_files", "write_file"],
-      names)
+      enc.count('"type":"function"') == 6, enc.count('"type":"function"'))
+names = sorted(tools[i]["function"]["name"] for i in range(1, 7))
+check("six tools present",
+      names == ["delete_file", "list_files", "read_file", "run_command",
+                "search_files", "write_file"], names)
+check("run_command's description says it is a shell, not Lua",
+      "not a Lua interpreter" in enc, None)
 
 print("== normaliseArgs ==")
 na = mod["normaliseArgs"]
@@ -281,6 +285,7 @@ check("write_file asks first", needs["write_file"] is True)
 check("run_command asks first", needs["run_command"] is True)
 check("read_file does not ask", needs["read_file"] is None)
 check("search_files does not ask", needs["search_files"] is None)
+check("delete_file asks first", needs["delete_file"] is True)
 
 mod["setReplies"](lua.eval(r"""{
   '{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"path":"/tmp/x","content":"hi"}}}]},"done":true}',
@@ -562,6 +567,45 @@ check("write_file appends when asked",
 
 res = call("write_file", path=out)
 check("write_file without content is an error", res["error"] is not None)
+
+print("== delete_file ==")
+# The model previously improvised deletion as run_command os.remove("x"), which
+# the OpenOS shell treats as a program name. It failed with "file not found",
+# the model read that as "already gone", and the file survived.
+fsfiles = lua.globals()["__fsfiles"]
+fsfiles["/home/workspace/test.txt"] = "file"
+fsfiles["/home/workspace"] = "dir"
+
+res = call("delete_file", path="workspace/test.txt")
+check("a relative path is resolved against the working directory",
+      res["success"] is True, res["error"] if res["error"] else res["success"])
+check("the file is actually gone", fsfiles["/home/workspace/test.txt"] is None)
+check("the result names what went", "test.txt" in str(res["deleted"]), res["deleted"])
+
+res = call("delete_file", path="workspace/test.txt")
+check("deleting something absent is an error, not a silent success",
+      res["error"] is not None and "does not exist" in res["error"], res["error"])
+check("and resultToText makes that unmistakable",
+      r2t(res).startswith("Error: "), r2t(res))
+
+res = call("delete_file", path="workspace")
+check("a directory is refused without recursive",
+      res["error"] is not None and "recursive" in res["error"], res["error"])
+res = call("delete_file", path="workspace", recursive=True)
+check("a directory goes when recursive is passed", res["success"] is True, res["error"])
+
+res = call("delete_file")
+check("a missing path is an error", res["error"] is not None)
+
+print("== a failed command announces itself ==")
+lua.execute("_G.__shellok = false")
+res = call("run_command", command="os.remove('workspace/test.txt')")
+check("a shell failure is stated outright, not left to be inferred",
+      "FAILED" in res["output"], res["output"][:80])
+check("and is flagged structurally too", res["failed"] is True, res["failed"])
+lua.execute("_G.__shellok = true")
+res = call("run_command", command="ls")
+check("a successful command is not marked failed", res["failed"] is None, res["failed"])
 
 big = os.path.join(tmp, "big.txt").replace("\\", "/")
 open(big, "w", encoding="utf-8").write("z" * 50000)

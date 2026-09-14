@@ -283,13 +283,21 @@ to scroll, and tap any footer button. Pasting into the terminal works too.
 | `list_files` | no | List a directory |
 | `search_files` | no | Find text across a directory tree, with file:line results |
 | `write_file` | **yes** | Write or append, creating parent directories |
-| `run_command` | **yes** | Run a shell command and return its output |
+| `delete_file` | **yes** | Delete a file, or a directory with `recursive` |
+| `run_command` | **yes** | Run an OpenOS **shell** command and return its output |
 
 Read-only tools run unattended. Anything that can change the computer shows a
 confirmation box you can answer by key (`Y` / `N`) or by tapping.
 
 `search_files` exists because OpenOS has no `grep`, and "find where this is
 defined" is the single most useful thing a coding assistant does.
+
+`delete_file` exists because without it the model improvises deletion through
+`run_command` as Lua — `os.remove("x")` — which the OpenOS shell treats as the
+name of a program to run. It fails with "file not found", which reads exactly
+like "the file is already gone", so the model reports success while the file is
+still there. `run_command` now also states outright when a command failed
+rather than leaving that to be inferred from stderr.
 
 ### Unsafe mode
 

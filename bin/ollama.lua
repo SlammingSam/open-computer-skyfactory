@@ -88,12 +88,21 @@ end
 local SYSTEM_PROMPT =
   "You are a terminal assistant running on an OpenComputers computer inside " ..
   "Minecraft. You have tools that act on THIS machine: read_file, write_file, " ..
-  "list_files, search_files and run_command. Use them whenever a question is " ..
-  "about files, directories or the state of this computer — do not guess at " ..
-  "file contents you have not read.\n\n" ..
+  "delete_file, list_files, search_files and run_command. Use them whenever a " ..
+  "question is about files, directories or the state of this computer — do " ..
+  "not guess at file contents you have not read.\n\n" ..
   "Work one step at a time: call a tool, look at the result, then decide the " ..
   "next step. Prefer list_files or search_files to locate something before " ..
   "reading it.\n\n" ..
+  "run_command runs OpenOS SHELL commands — ls, cat, cp, mv, mkdir, rm — not " ..
+  "Lua code. Passing a Lua expression makes the shell look for a program by " ..
+  "that name and fail. To delete something use delete_file.\n\n" ..
+  "Check results before reporting success. If a tool says FAILED or returns " ..
+  "an error, say what went wrong; do not assume the job is done. Verify a " ..
+  "deletion or a write with list_files when it matters.\n\n" ..
+  "Before writing code that calls a library on this machine, read that " ..
+  "library with read_file and use the functions it actually defines, rather " ..
+  "than guessing names.\n\n" ..
   "Answer in plain text only. No markdown headers, bold, or bullet syntax — " ..
   "output is shown on a low-resolution in-game screen. Keep replies short."
 
@@ -500,6 +509,33 @@ local function toolWriteFile(input)
   return { success = true, bytesWritten = #content }
 end
 
+-- Without this the model improvises deletion through run_command, usually as a
+-- Lua expression like os.remove("x") -- which the OpenOS shell treats as the
+-- name of a program to run, fails to find, and reports as "file not found".
+-- That reads exactly like "the file is already gone", so the model concludes
+-- the job is done while the file is still sitting there.
+local function toolDeleteFile(input)
+  if not filesystem then return { error = "filesystem library not available" } end
+  local path = input.path
+  if type(path) ~= "string" or path == "" then return { error = "missing path" } end
+
+  local abs = resolvePath(path)
+  if not filesystem.exists(abs) then
+    return { error = "nothing to delete: " .. abs .. " does not exist" }
+  end
+  if filesystem.isDirectory(abs) and not input.recursive then
+    return { error = abs .. " is a directory. Pass recursive=true to delete it " ..
+                     "and everything inside it." }
+  end
+
+  local ok, err = pcall(filesystem.remove, abs)
+  if not ok then return { error = "could not delete " .. abs .. ": " .. tostring(err) } end
+  if filesystem.exists(abs) then
+    return { error = "delete reported success but " .. abs .. " is still there" }
+  end
+  return { success = true, deleted = abs }
+end
+
 local function toolListFiles(input)
   if not filesystem then return { error = "filesystem library not available" } end
   local path = resolvePath(input.path or ".")
@@ -650,9 +686,17 @@ local function toolRunCommand(input)
     combined = combined .. (combined ~= "" and "\n" or "") .. "[stderr] " .. errOut
   end
   if combined == "" then
-    combined = (res == false) and "(command reported failure, no output)" or "(no output)"
+    combined = "(no output)"
   end
-  return { output = truncate(combined) }
+
+  -- Say outright that it failed. Leaving the model to infer it from stderr is
+  -- how "file not found" got read as "the file is already gone" -- the shell
+  -- was reporting that it could not find a PROGRAM by that name.
+  if res == false then
+    combined = "The command FAILED (the shell returned an error).\n" .. combined
+  end
+
+  return { output = truncate(combined), failed = (res == false) or nil }
 end
 
 -- Tool definitions in Ollama's OpenAI-compatible shape. Note this is NOT the
@@ -723,12 +767,27 @@ local TOOLS = {
   {
     type = "function",
     ["function"] = {
-      name = "run_command",
-      description = "Run a shell command on this computer and return its output.",
+      name = "delete_file",
+      description = "Delete a file or directory on this computer. Use this rather than trying to delete through run_command.",
       parameters = {
         type = "object",
         properties = {
-          command = { type = "string", description = "Shell command to execute" },
+          path = { type = "string", description = "Path to delete" },
+          recursive = { type = "boolean", description = "Required to delete a directory and its contents" },
+        },
+        required = { "path" },
+      },
+    },
+  },
+  {
+    type = "function",
+    ["function"] = {
+      name = "run_command",
+      description = "Run an OpenOS SHELL command (ls, cat, cp, mv, mkdir, rm, edit) and return its output. This is a shell, not a Lua interpreter: passing Lua such as os.remove(\"x\") makes the shell look for a program with that name and fail.",
+      parameters = {
+        type = "object",
+        properties = {
+          command = { type = "string", description = "Shell command line to execute" },
         },
         required = { "command" },
       },
@@ -739,6 +798,7 @@ local TOOLS = {
 local TOOL_IMPL = {
   read_file    = toolReadFile,
   write_file   = toolWriteFile,
+  delete_file  = toolDeleteFile,
   list_files   = toolListFiles,
   search_files = toolSearchFiles,
   run_command  = toolRunCommand,
@@ -746,7 +806,7 @@ local TOOL_IMPL = {
 
 -- Tools that can change this computer ask first. read_file, list_files and
 -- search_files cannot change anything, so they run unattended.
-local NEEDS_CONFIRMATION = { write_file = true, run_command = true }
+local NEEDS_CONFIRMATION = { write_file = true, delete_file = true, run_command = true }
 
 local function resultToText(result)
   if result.error then return "Error: " .. tostring(result.error) end
@@ -755,7 +815,9 @@ local function resultToText(result)
   elseif result.entries ~= nil then body = table.concat(result.entries, "\n")
   elseif result.output ~= nil then body = tostring(result.output)
   elseif result.success then
-    body = "OK" .. (result.bytesWritten and (" (" .. result.bytesWritten .. " bytes written)") or "")
+    body = "OK"
+    if result.bytesWritten then body = body .. " (" .. result.bytesWritten .. " bytes written)" end
+    if result.deleted then body = body .. " (deleted " .. result.deleted .. ")" end
   else
     body = json.encode(result)
   end
