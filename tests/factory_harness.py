@@ -25,6 +25,9 @@ _G.__now = 0
 _G.__files = {}
 _G.__me = {}          -- method name -> function, set per test
 _G.__requests = {}    -- every entry.request(qty) that actually happened
+_G.__beeps = 0        -- how many times the pause signal sounded
+_G.__power = 1000
+_G.__maxpower = 2000
 
 local function ser(v)
   if type(v) == "table" then
@@ -98,7 +101,10 @@ local stubs = {
     end,
   },
   event = { pull = function() return nil end },
-  computer = { uptime = function() return _G.__now end },
+  computer = {
+    uptime = function() return _G.__now end,
+    beep = function() _G.__beeps = (_G.__beeps or 0) + 1 end,
+  },
   term = { clear = function() end, setCursor = function() end },
   unicode = { len = string.len, sub = string.sub },
   serialization = { serialize = ser, unserialize = unser },
@@ -130,6 +136,8 @@ return {
   refresh = refresh,
   loadCraftables = loadCraftables,
   evaluateAutoCraft = evaluateAutoCraft,
+  handleSettingsKey = handleSettingsKey,
+  ui = ui,
   findItemByKey = findItemByKey,
   freeCpuBudget = freeCpuBudget,
   quantityInFlight = quantityInFlight,
@@ -188,8 +196,8 @@ def set_network(items, cpus=None, craftables=None):
         cpurows[i] = lua.table_from({"busy": busy})
     me["getCpus"] = lua.eval("function(c) return function() return c end end")(cpurows)
 
-    me["getStoredPower"] = lua.eval("function() return 1000 end")
-    me["getMaxStoredPower"] = lua.eval("function() return 2000 end")
+    me["getStoredPower"] = lua.eval("function() return _G.__power end")
+    me["getMaxStoredPower"] = lua.eval("function() return _G.__maxpower end")
 
 
 def requests():
@@ -205,13 +213,29 @@ def advance(seconds):
     lua.globals()["__now"] = lua.globals()["__now"] + seconds
 
 
-def configure(rules, enabled=True, maxBatch=1000, reserveCpus=1, checkSeconds=0):
+def set_power(percent):
+    lua.globals()["__power"] = percent * 20      # of a 2000 maximum
+    lua.globals()["__maxpower"] = 2000
+
+
+def beeps():
+    return lua.globals()["__beeps"]
+
+
+def reset_beeps():
+    lua.execute("_G.__beeps = 0")
+
+
+def configure(rules, enabled=True, maxBatch=1000, reserveCpus=1, checkSeconds=0,
+              minPowerPct=0):
     s = F["settings"]
     ac = s["autoCraft"]
     ac["enabled"] = enabled
     ac["maxBatch"] = maxBatch
     ac["reserveCpus"] = reserveCpus
     ac["checkSeconds"] = checkSeconds
+    ac["minPowerPct"] = minPowerPct
+    ac["beep"] = True
     rows = lua.eval("{}")
     for i, r in enumerate(rules, 1):
         rows[i] = lua.table_from(r)
@@ -219,6 +243,7 @@ def configure(rules, enabled=True, maxBatch=1000, reserveCpus=1, checkSeconds=0)
     F["state"]["autoCraftCheckedAt"] = None
     F["state"]["autoCraftBackoff"] = lua.eval("{}")
     F["state"]["jobs"] = lua.eval("{}")
+    F["state"]["autoCraftPowerPaused"] = None
 
 
 # Two items, both craftable, so rules can target either.
@@ -416,6 +441,112 @@ check("merging fills in keys a new version added",
 check("without disturbing what was already saved",
       merged["autoCraft"]["enabled"] is True)
 
+print("== the power floor ==")
+# AE2 crafting is what drains the network, so the useful moment to stop is
+# before starting more of it. Off by default, so upgrading cannot halt a setup
+# that was working.
+set_power(100)
+prime(iron=10)
+configure([{"key": IKEY, "label": "Iron Ingot", "direction": "below",
+             "threshold": 100, "craftQty": 64, "enabled": True}], minPowerPct=0)
+F["evaluateAutoCraft"]()
+check("a floor of zero disables the check", requests() == [("Iron Ingot", 64)], requests())
+
+set_power(30)
+prime(iron=10)
+configure([{"key": IKEY, "label": "Iron Ingot", "direction": "below",
+             "threshold": 100, "craftQty": 64, "enabled": True}], minPowerPct=50)
+reset_beeps()
+F["evaluateAutoCraft"]()
+check("nothing is dispatched below the floor", requests() == [], requests())
+check("and the pause is sounded once", beeps() == 1, beeps())
+
+F["state"]["autoCraftCheckedAt"] = None
+F["evaluateAutoCraft"]()
+check("a continuing shortage is not re-announced every pass", beeps() == 1, beeps())
+
+set_power(80)
+F["refresh"]()
+reset_requests()
+F["state"]["autoCraftCheckedAt"] = None
+F["evaluateAutoCraft"]()
+check("crafting resumes once power recovers",
+      requests() == [("Iron Ingot", 64)], requests())
+
+set_power(10)
+prime(iron=10)
+configure([{"key": IKEY, "label": "Iron Ingot", "direction": "below",
+             "threshold": 100, "craftQty": 64, "enabled": True}], minPowerPct=50)
+reset_beeps()
+F["evaluateAutoCraft"]()
+check("a later dip is announced again", beeps() == 1, beeps())
+
+set_power(100)
+prime(iron=10)
+configure([{"key": IKEY, "label": "Iron Ingot", "direction": "below",
+             "threshold": 100, "craftQty": 64, "enabled": True}], minPowerPct=50)
+F["settings"]["autoCraft"]["beep"] = False
+set_power(10)
+F["refresh"]()
+reset_beeps()
+F["state"]["autoCraftPowerPaused"] = None
+F["state"]["autoCraftCheckedAt"] = None
+F["evaluateAutoCraft"]()
+check("beeping can be turned off", beeps() == 0, beeps())
+check("but the pause still happened", F["state"]["autoCraftPowerPaused"] is True,
+      F["state"]["autoCraftPowerPaused"])
+F["settings"]["autoCraft"]["beep"] = True
+set_power(100)
+
+print("== reordering rules ==")
+# Rules dispatch in list order, so with a finite CPU budget one near the top
+# can take the last free CPU on every pass and starve everything below it.
+prime(iron=10)
+configure([
+    {"key": IKEY, "label": "First", "direction": "below",
+     "threshold": 100, "craftQty": 1, "enabled": True},
+    {"key": IKEY, "label": "Second", "direction": "below",
+     "threshold": 100, "craftQty": 2, "enabled": True},
+    {"key": IKEY, "label": "Third", "direction": "below",
+     "threshold": 100, "craftQty": 3, "enabled": True},
+])
+
+
+def order():
+    rs = F["settings"]["autoCraft"]["rules"]
+    return [rs[i]["label"] for i in range(1, len(rs) + 1)]
+
+
+F["ui"]["acSelected"] = 1
+F["handleSettingsKey"](ord("J"), 0)
+check("Shift+J moves the selected rule down",
+      order() == ["Second", "First", "Third"], order())
+check("and the selection follows it", F["ui"]["acSelected"] == 2,
+      F["ui"]["acSelected"])
+
+F["handleSettingsKey"](ord("K"), 0)
+check("Shift+K moves it back up",
+      order() == ["First", "Second", "Third"], order())
+check("and the selection follows again", F["ui"]["acSelected"] == 1)
+
+F["ui"]["acSelected"] = 1
+F["handleSettingsKey"](ord("K"), 0)
+check("moving up from the top does nothing",
+      order() == ["First", "Second", "Third"], order())
+check("and leaves the selection alone", F["ui"]["acSelected"] == 1)
+
+F["ui"]["acSelected"] = 3
+F["handleSettingsKey"](ord("J"), 0)
+check("moving down from the bottom does nothing",
+      order() == ["First", "Second", "Third"], order())
+
+# Lowercase must still move the cursor rather than the rule.
+F["ui"]["acSelected"] = 1
+F["handleSettingsKey"](ord("j"), 0)
+check("lowercase j still moves the cursor, not the rule",
+      order() == ["First", "Second", "Third"] and F["ui"]["acSelected"] == 2,
+      (order(), F["ui"]["acSelected"]))
+
 print("== settings that came off disk damaged ==")
 # Settings are read from a file that can be hand-edited or half-written. Every
 # consumer guards its numbers, but a rule that is not a table, or a direction
@@ -483,6 +614,19 @@ bad2 = F["defaultSettings"]()
 bad2["autoCraft"]["enabled"] = "yes"
 check("a non-boolean enabled is forced to a boolean, not left truthy",
       san(bad2)["autoCraft"]["enabled"] is False)
+
+pw = F["defaultSettings"]()
+pw["autoCraft"]["minPowerPct"] = 500
+check("a power floor above 100 is clamped",
+      san(pw)["autoCraft"]["minPowerPct"] == 100, san(pw)["autoCraft"]["minPowerPct"])
+pw2 = F["defaultSettings"]()
+pw2["autoCraft"]["minPowerPct"] = "lots"
+check("a non-numeric power floor becomes off",
+      san(pw2)["autoCraft"]["minPowerPct"] == 0)
+pw3 = F["defaultSettings"]()
+pw3["autoCraft"]["minPowerPct"] = -10
+check("a negative power floor becomes off",
+      san(pw3)["autoCraft"]["minPowerPct"] == 0)
 
 # The point of all this: evaluation must survive whatever was on disk.
 prime(iron=10)

@@ -72,6 +72,15 @@ local function defaultSettings()
       -- else on the network) always has somewhere to run, instead of queuing
       -- behind a long automated conversion.
       reserveCpus = 1,
+      -- Percentage of stored power below which no new job is started. AE2
+      -- crafting draws power, and a long conversion begun on a nearly flat
+      -- network can brown it out with nobody watching. 0 disables the check,
+      -- which is the default so this cannot stop a working setup on upgrade.
+      minPowerPct = 0,
+      -- A short beep when auto-crafting stops on its own. The dashboard runs
+      -- unattended, and a pause visible only on screen is one nobody learns
+      -- about until they walk past it.
+      beep = true,
       rules = {},          -- {key, label, direction="below"|"above", threshold, craftQty, enabled}
     },
   }
@@ -106,6 +115,11 @@ local function sanitiseSettings(s)
   local ac = s.autoCraft
 
   ac.enabled = (ac.enabled == true)
+
+  ac.beep = (ac.beep ~= false)
+
+  local pct = tonumber(ac.minPowerPct)
+  ac.minPowerPct = pct and math.max(0, math.min(100, math.floor(pct))) or 0
 
   local floors = { maxBatch = 1, reserveCpus = 0, checkSeconds = 1 }
   for field, floor in pairs(floors) do
@@ -381,6 +395,8 @@ local state = {
   jobs = {},         -- live craft jobs: {label, qty, obj, startedAt, status}
   autoCraftBackoff = {},    -- "key|direction" -> uptime a cancelled job was seen
   autoCraftCheckedAt = nil,
+  autoCraftPowerPaused = nil, -- set while held off by the power floor, so the
+                              -- pause is logged and sounded once, not every pass
 }
 
 -- Identity key for a stack. In 1.12.2 `damage` is the variant discriminator
@@ -638,8 +654,10 @@ local SETTINGS_TABS = {"Auto-Craft", "Log"}
 -- Editable global auto-craft numbers: which key opens each, and the lowest
 -- value each will accept. A reserve of zero is legitimate; a batch size or a
 -- check interval of zero is not.
-local AC_GLOBAL_KEYS = {m = "maxBatch", v = "reserveCpus", i = "checkSeconds"}
-local AC_GLOBAL_MIN  = {maxBatch = 1, reserveCpus = 0, checkSeconds = 1}
+local AC_GLOBAL_KEYS = {m = "maxBatch", v = "reserveCpus", i = "checkSeconds",
+                        p = "minPowerPct"}
+local AC_GLOBAL_MIN  = {maxBatch = 1, reserveCpus = 0, checkSeconds = 1,
+                        minPowerPct = 0}
 
 local function setStatus(msg, kind)
   ui.status = msg
@@ -685,6 +703,13 @@ end
 -- How long a rule sits out after AE2 cancels one of its jobs, before it is
 -- allowed to try again (the missing ingredient may have arrived by then).
 local AUTO_CRAFT_RETRY_SECONDS = 120
+
+-- Sounded when auto-crafting stops by itself. Wrapped in pcall because a
+-- computer without a speaker is perfectly normal and must not crash the loop.
+local function notifyPause()
+  if settings.autoCraft.beep == false then return end
+  pcall(function() computer.beep(880, 0.15) end)
+end
 
 local function findItemByKey(key)
   if not key then return nil end          -- else items with a nil key match
@@ -736,6 +761,28 @@ local function evaluateAutoCraft()
   end
   state.autoCraftCheckedAt = computer.uptime()
 
+  -- Power floor, checked before any rule runs. Crafting is what drains the
+  -- network, so the useful moment to stop is before starting more of it.
+  local floorPct = math.max(0, math.floor(tonumber(ac.minPowerPct) or 0))
+  if floorPct > 0 and (tonumber(state.maxPower) or 0) > 0 then
+    local pct = (state.power / state.maxPower) * 100
+    if pct < floorPct then
+      if not state.autoCraftPowerPaused then
+        state.autoCraftPowerPaused = true
+        logEvent("pause", "auto-craft", 0,
+                 string.format("power %d%% is below the %d%% floor",
+                               math.floor(pct), floorPct))
+        setStatus(string.format(
+          "auto-craft paused: power %d%% is below the %d%% floor",
+          math.floor(pct), floorPct), "warn")
+        notifyPause()
+      end
+      return
+    end
+    -- Recovered. Cleared so a later dip is announced again.
+    state.autoCraftPowerPaused = nil
+  end
+
   local globalBatch = math.max(1, math.floor(tonumber(ac.maxBatch) or 1000))
   local budget = freeCpuBudget()      -- shared across all rules this pass
 
@@ -779,6 +826,7 @@ local function evaluateAutoCraft()
                      "cancelled job; backing off " .. AUTO_CRAFT_RETRY_SECONDS .. "s")
             setStatus("auto-craft paused for " .. label
                       .. ": last job was cancelled — try a smaller max batch", "bad")
+            notifyPause()
           end
           backingOff = since ~= nil
         end
@@ -1281,6 +1329,10 @@ local function drawAutoCraftTab()
   seg("MAX BATCH", globalValue("maxBatch", comma(ac.maxBatch or 1000)), C.craft, "M")
   seg("RESERVE CPUS", globalValue("reserveCpus", tostring(ac.reserveCpus or 0)), C.craft, "V")
   seg("CHECK EVERY", globalValue("checkSeconds", tostring(ac.checkSeconds or 15) .. "s"), C.craft, "I")
+  seg("POWER FLOOR",
+      globalValue("minPowerPct",
+        (tonumber(ac.minPowerPct) or 0) > 0 and (tostring(ac.minPowerPct) .. "%") or "off"),
+      ((tonumber(ac.minPowerPct) or 0) > 0) and C.craft or C.zero, "P")
 
   -- Live CPU picture, so the reserve number means something concrete.
   seg("CPUS", string.format("%d idle of %d",
@@ -1605,6 +1657,8 @@ local function drawSettingsFooter()
     {"M", "all batch", {char = string.byte("m")}},
     {"V", "reserve",   {char = string.byte("v")}},
     {"I", "interval",  {char = string.byte("i")}},
+    {"P", "power",     {char = string.byte("p")}},
+    {"⇧JK", "reorder", nil},
     {"O", "back",      {char = string.byte("o")}},
     {"Q", "quit",      {char = string.byte("q")}},
   })
@@ -2056,6 +2110,26 @@ local function handleSettingsKey(char, code)
       end
     else
       ui.acEditText = editNumber(ui.acEditText, char, code, 7)
+    end
+    return
+  end
+
+  -- Shift+J and Shift+K move the selected rule instead of the cursor. Order
+  -- matters as soon as the CPU budget is finite: rules dispatch in list order,
+  -- so one near the top can take the last free CPU on every pass and starve
+  -- everything below it. Checked before ch is lowercased.
+  if char == string.byte("J") or char == string.byte("K") then
+    local from = ui.acSelected
+    local to = (char == string.byte("J")) and (from + 1) or (from - 1)
+    if rules[from] and rules[to] then
+      rules[from], rules[to] = rules[to], rules[from]
+      ui.acSelected = to
+      local ok, err = saveSettings(settings)
+      setStatus(
+        ok and ("moved " .. tostring(rules[to].label) .. ((to > from) and " down" or " up"))
+            or ("moved but NOT saved to disk: " .. tostring(err)),
+        ok and "info" or "bad"
+      )
     end
     return
   end
