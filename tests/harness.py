@@ -299,6 +299,16 @@ check("history records assistant then tool",
 check("tool message carries tool_name",
       hist2[4]["tool_name"] == "list_files", hist2[4]["tool_name"])
 
+# When the model reports something the tools never said, the first question is
+# whether it was sent the results at all. It is, and this proves it: the second
+# request carries the tool output verbatim, and the assistant turn that asked
+# for it, so a wrong answer is the model's reasoning rather than a lost message.
+sent = mod["lastRequest"]()["payload"]
+check("the follow-up request includes the tool result", '"role":"tool"' in sent, None)
+check("with the actual output in it", "list_files" in sent, None)
+check("and the assistant turn that requested it",
+      '"tool_calls"' in sent, None)
+
 print("== permission gating ==")
 needs = mod["NEEDS_CONFIRMATION"]
 check("write_file asks first", needs["write_file"] is True)

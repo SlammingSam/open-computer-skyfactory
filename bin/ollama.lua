@@ -51,7 +51,11 @@ local NUM_CTX = 8192
 -- http.lua's request timeout — see TIMEOUT in http.lua and OLLAMA.md.
 local NUM_PREDICT = 600
 
-local TEMPERATURE = 0.6
+-- Low on purpose. This is an agent reporting facts it was handed, not a
+-- writing assistant: at 0.6 a 7B model will cheerfully report "none was found"
+-- while holding the answer, because the phrase was in the question. Raise it
+-- with OLLAMA_TEMPERATURE if you want more variety and care less about that.
+local TEMPERATURE = 0.3
 
 -- Keeps the model resident in VRAM between messages, so only the first request
 -- after a cold start pays the load cost.
@@ -100,10 +104,13 @@ local SYSTEM_PROMPT =
   "Check results before reporting success. If a tool says FAILED or returns " ..
   "an error, say what went wrong; do not assume the job is done. Verify a " ..
   "deletion or a write with list_files when it matters.\n\n" ..
-  "Read output literally. If it does not look like an answer to the question " ..
-  "— an address, a number, a list — then something is wrong with the code or " ..
-  "the command, and repeating it unchanged will not help. Say what you " ..
-  "actually got.\n\n" ..
+  "Report what the tools actually returned. Quote the real output rather than " ..
+  "describing what you expected, and never reuse a phrase from the question " ..
+  "as if it were a result — if the question said \"or say none was found\" and " ..
+  "the tool returned an address, the answer is that address.\n\n" ..
+  "If output does not look like an answer to the question — an address, a " ..
+  "number, a list — then something is wrong with the code or the command, and " ..
+  "repeating it unchanged will not help.\n\n" ..
   "Before writing code that calls a library on this machine, read that " ..
   "library with read_file and use the functions it actually defines, rather " ..
   "than guessing names.\n\n" ..
@@ -223,6 +230,7 @@ end
 local JSON_HEADERS = { ["Content-Type"] = "application/json" }
 
 local lastStats = nil   -- token counts from the most recent reply, for the UI
+local lastPayload = nil -- the most recent request body, for /last
 
 -- Turns http.lua's error strings into something that names the actual fix.
 local function explainNetworkError(err)
@@ -382,6 +390,7 @@ local function ollamaChat(messages, tools)
     payload = buildBody()
   end
 
+  lastPayload = payload
   local data, err = postPayload("/api/chat", payload)
   if not data then return nil, err end
   if type(data.message) ~= "table" then
@@ -1709,6 +1718,7 @@ local HELP_TEXT =
   "  /tools           list the tools the model can call\n" ..
   "  /diag            probe the connection and report exactly what came back\n" ..
   "  /prompt          show the system prompt the model is given\n" ..
+  "  /last            show the messages sent in the last request\n" ..
   "  /unsafe          toggle skipping permission prompts\n" ..
   "  /save <path>     write this conversation to a file\n" ..
   "  /help            this list\n" ..
@@ -1775,6 +1785,42 @@ local function runCommand(line)
         "\n      " .. f.description
     end
     addEntry("info", "Tools available to the model:\n" .. table.concat(names, "\n"))
+
+  elseif cmd == "/last" then
+    -- When the model reports something the tools never said, the first
+    -- question is whether it was actually sent the results. This answers that
+    -- instead of leaving it to be guessed at.
+    if not lastPayload then
+      setStatus("nothing sent yet", "warn")
+    else
+      local decoded = json.decode(lastPayload)
+      local msgs = decoded and decoded.messages
+      if type(msgs) ~= "table" then
+        addEntry("info", "Last request (" .. #lastPayload .. " bytes):\n" ..
+                         lastPayload:sub(1, 1500))
+      else
+        local out = {}
+        for i, m in ipairs(msgs) do
+          local body = (type(m.content) == "string") and m.content or ""
+          body = body:gsub("%s+", " ")
+          if #body > 90 then body = body:sub(1, 90) .. "…" end
+          local tag = m.role
+          if m.tool_name then tag = tag .. "/" .. m.tool_name end
+          if m.tool_calls then
+            local names = {}
+            for _, c in ipairs(m.tool_calls) do
+              local f = c["function"] or {}
+              names[#names + 1] = tostring(f.name or "?")
+            end
+            body = "[calls: " .. table.concat(names, ", ") .. "] " .. body
+          end
+          out[#out + 1] = string.format("%2d %-14s %s", i, tag, body)
+        end
+        addEntry("info", string.format("Last request: %d messages, %d bytes\n%s",
+                                       #msgs, #lastPayload, table.concat(out, "\n")))
+      end
+      setStatus("this is exactly what the model was given", "info")
+    end
 
   elseif cmd == "/prompt" then
     local text = systemPrompt()

@@ -195,6 +195,29 @@ Results are also written to `/home/nettest.txt`.
 length and first bytes of what actually came back, instead of trying to
 interpret it.
 
+### It reports something the tools never said
+
+Seen in testing: a program correctly printed the proxy address, the tool
+returned it, and the model said "none was found" — a phrase lifted from the
+question's own fallback wording rather than from the output.
+
+Run `/last`. It lists every message in the most recent request, so you can see
+whether the tool result was actually sent. If it is there (it will be), the
+toolchain is fine and the model's reasoning is what failed.
+
+What helps:
+
+- **`OLLAMA_TEMPERATURE`** defaults to 0.3 for exactly this reason. This is an
+  agent reporting facts it was handed, not a writing assistant. Raising it
+  makes confabulation more likely, not less.
+- **Ask for the output, not a conclusion.** "Run it and show me the output" is
+  answered more reliably than "run it and tell me whether a proxy was found".
+- **Avoid putting the wrong answer in the question.** A prompt containing "or
+  say none was found" hands a small model a plausible phrase to reach for.
+
+This one is a model limitation rather than a bug in the client. A 7B model
+handles it imperfectly; if it matters, `/model` to something larger.
+
 ### A multi-step job stops halfway
 
 The conversation budget comes from `OLLAMA_NUM_CTX`. When it fills, the oldest
@@ -269,6 +292,7 @@ to scroll, and tap any footer button. Pasting into the terminal works too.
 | `/tools` | List the tools the model can call |
 | `/diag` | Probe the connection and report exactly what came back |
 | `/prompt` | Show the system prompt the model is given, and its token cost |
+| `/last` | Show the messages sent in the last request |
 | `/unsafe` | Toggle skipping permission prompts |
 | `/save <path>` | Write the conversation to a file |
 | `/help` | Command list |
