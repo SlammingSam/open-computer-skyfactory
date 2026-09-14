@@ -37,6 +37,17 @@ ollama pull qwen2.5:7b-instruct
 - Pascal cards have no fast FP16 path, so a 4-bit quant is the right call
   anyway. Expect roughly 25–40 tokens/sec.
 
+**If you mostly ask it to write code, use `qwen2.5-coder:7b` instead.** Same
+size, same VRAM, substantially better at Lua and at fixing its own mistakes.
+Testing the instruct model on a write-a-program task, it hit a nil global,
+and rather than adding the missing `require` line it replaced the real library
+with a stub returning a hardcoded `192.0.2.1` — then reported that as the
+computer's proxy address. The coder variant is far less prone to that.
+
+```bash
+ollama pull qwen2.5-coder:7b
+```
+
 **Alternatives**, switchable at runtime with `/model <name>`:
 
 | Model | Size | When to use it |
@@ -194,6 +205,25 @@ Results are also written to `/home/nettest.txt`.
 `/diag` inside the app probes the connection and reports the status, body
 length and first bytes of what actually came back, instead of trying to
 interpret it.
+
+### It fabricates a library, or hardcodes an answer
+
+The worst failure mode, and the reason `write_file` now reports when it
+replaces an existing file. A model that cannot get a program running will
+sometimes stub out the real library so its own test passes:
+
+```lua
+local http = { proxyAddress = function() return "192.0.2.1" end }
+```
+
+`192.0.2.1` is the IANA documentation placeholder — a reliable tell that a
+value was invented rather than read. The system prompt now forbids this
+explicitly, and a replacement shows in the transcript as
+`REPLACING an existing 55-byte file`, but the real fix is a better model:
+`qwen2.5-coder:7b` is the same size and much less prone to it.
+
+Watch for a `REPLACING` note on a file the model just failed to run. That
+sequence — run, fail, overwrite, succeed — is almost always this.
 
 ### It reports something the tools never said
 

@@ -114,6 +114,13 @@ local SYSTEM_PROMPT =
   "Before writing code that calls a library on this machine, read that " ..
   "library with read_file and use the functions it actually defines, rather " ..
   "than guessing names.\n\n" ..
+  "NEVER fake a library to make code run. If require fails, or a function is " ..
+  "missing, say so and stop. Do not define a stub, do not hardcode a value, " ..
+  "do not invent what the real one would have returned. A program that prints " ..
+  "a made-up answer is far worse than one that does not run, because it looks " ..
+  "like it worked.\n\n" ..
+  "When a program fails, fix the actual cause. A nil global usually means the " ..
+  "require line is missing, not that the library is broken.\n\n" ..
   "Answer in plain text only. No markdown headers, bold, or bullet syntax — " ..
   "output is shown on a low-resolution in-game screen. Keep replies short."
 
@@ -514,12 +521,34 @@ local function toolWriteFile(input)
     end
   end
 
+  -- Whether this replaces something matters: a model that has just failed to
+  -- run a program will sometimes overwrite it with a stub that returns a
+  -- hardcoded value, and saying so makes that visible instead of silent.
+  --
+  -- Probed with io.open rather than filesystem.exists so the path resolves
+  -- exactly the way the write below resolves it. The two disagree on relative
+  -- paths, and checking one while writing the other is how a replacement would
+  -- go unreported.
+  local replaced = nil
+  if not input.append then
+    local probe = io.open(path, "r")
+    if probe then
+      local ok, size = pcall(function() return probe:seek("end") end)
+      if not ok or type(size) ~= "number" then
+        local pok, existing = pcall(function() return probe:read("*a") end)
+        size = (pok and existing) and #existing or 0
+      end
+      probe:close()
+      replaced = size
+    end
+  end
+
   local mode = input.append and "a" or "w"
   local f, err = io.open(path, mode)
   if not f then return { error = "couldn't open file: " .. tostring(err) } end
   f:write(content)
   f:close()
-  return { success = true, bytesWritten = #content }
+  return { success = true, bytesWritten = #content, replaced = replaced }
 end
 
 -- Without this the model improvises deletion through run_command, usually as a
@@ -829,7 +858,13 @@ local function resultToText(result)
   elseif result.output ~= nil then body = tostring(result.output)
   elseif result.success then
     body = "OK"
-    if result.bytesWritten then body = body .. " (" .. result.bytesWritten .. " bytes written)" end
+    if result.bytesWritten then
+      body = body .. " (" .. result.bytesWritten .. " bytes written"
+      if result.replaced then
+        body = body .. ", REPLACING an existing " .. result.replaced .. "-byte file"
+      end
+      body = body .. ")"
+    end
     if result.deleted then body = body .. " (deleted " .. result.deleted .. ")" end
   else
     body = json.encode(result)
@@ -1145,6 +1180,11 @@ local function machineFacts()
     lines[#lines + 1] = "- Libraries available here, and the functions they" ..
                         " actually have (use these exact names):"
     for _, d in ipairs(described) do lines[#lines + 1] = d end
+    -- Spelled out because the failure it prevents is common and silent: code
+    -- that calls http.proxyAddress() without loading http first dies on a nil
+    -- global, which reads like the library is broken rather than absent.
+    lines[#lines + 1] = "  Load one before using it, every time:" ..
+                        "  local http = require(\"http\")  then  http.proxyAddress()"
     lines[#lines + 1] = "  Anything else: read the file with read_file first" ..
                         " rather than guessing what it provides."
   end

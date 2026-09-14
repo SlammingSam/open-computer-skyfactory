@@ -679,6 +679,25 @@ check("write_file appends when asked",
 res = call("write_file", path=out)
 check("write_file without content is an error", res["error"] is not None)
 
+# A model that has just failed to run a program will sometimes overwrite it
+# with a stub returning a hardcoded value, and then report that as the answer.
+# Making the replacement visible is the cheapest guard against that going by
+# unnoticed in the transcript.
+prog = os.path.join(tmp, "prog.lua").replace("\\", "/")
+open(prog, "w", encoding="utf-8").write("the original program")
+res = call("write_file", path=prog, content="stub")
+check("overwriting an existing file says so",
+      res["replaced"] == len("the original program"), res["replaced"])
+check("and resultToText makes it prominent",
+      "REPLACING" in r2t(res), r2t(res))
+
+res = call("write_file", path=os.path.join(tmp, "brand-new.lua").replace("\\", "/"), content="x")
+check("writing a new file says nothing about replacing",
+      res["replaced"] is None and "REPLACING" not in r2t(res), r2t(res))
+
+res = call("write_file", path=prog, content="more", append=True)
+check("appending is not a replacement", res["replaced"] is None, res["replaced"])
+
 print("== delete_file ==")
 # The model previously improvised deletion as run_command os.remove("x"), which
 # the OpenOS shell treats as a program name. It failed with "file not found",
