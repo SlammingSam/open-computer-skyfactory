@@ -71,7 +71,7 @@ def load(path, cut_marker=None, exports=""):
     return lua, lua.execute(src + exports)
 
 
-proxy_lua, proxy = load("proxy.lua", "-- ==== MAIN LOOP", """
+proxy_lua, proxy = load("bin/proxy.lua", "-- ==== MAIN LOOP", """
 return {
   sendSerialized = sendSerialized,
   collectChunk = collectChunk,
@@ -79,7 +79,7 @@ return {
 }
 """)
 
-http_lua, client = load("http.lua", None, """
+http_lua, client = load("lib/http.lua", None, """
 return {
   sendSerialized = sendSerialized,
   collectChunk = collectChunk,

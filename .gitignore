@@ -1,0 +1,17 @@
+# Secrets and per-machine settings. The real file lives at /home/.env on the
+# OpenComputers machine and must never be committed - see .env.example.
+.env
+*.env
+!.env.example
+
+# Updater bookkeeping, written on the OC machine.
+.update_state
+.update_state.tmp
+
+# Local settings and logs written by factory.lua
+.factory_settings.cfg*
+.factory_log.cfg*
+nettest.txt
+
+__pycache__/
+*.pyc

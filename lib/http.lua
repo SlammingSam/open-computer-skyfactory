@@ -37,14 +37,38 @@ assert(component.isAvailable("modem"), "This computer needs a Network Card")
 local network = component.modem -- alias: modem == "network card"
 
 -- ==== CONFIG ====================================================
--- The proxy computer's modem address, printed on proxy startup. Leaving this
--- as the placeholder is fine: the client asks the network who the proxy is on
--- first use, so this file can be replaced without losing your setup.
-local PROXY_ADDRESS = "PUT-PROXY-MODEM-ADDRESS-HERE"
+-- The proxy address is NOT stored in this file. It comes from /home/.env, so
+-- that updating this file cannot lose it:
+--
+--   PROXY_ADDRESS=e66d90a3-8a83-4b8a-930a-2aecdfaefb59
+--
+-- If it is missing, the client asks the network who the proxy is and writes
+-- the answer back to /home/.env, so discovery happens once rather than on
+-- every request. Setting it by hand always wins over discovery.
 
 local PORT = 123       -- must match PORT in proxy.lua
 local TIMEOUT = 90     -- seconds to wait for a response before giving up
 local DISCOVER_TIMEOUT = 3
+
+-- Loads a module from lib/ whether it was installed, cloned, or is sitting in
+-- the working directory. env is optional: without it this file still works,
+-- it just has to rediscover the proxy each run.
+local function loadModule(name)
+  local ok, mod = pcall(require, name)
+  if ok and type(mod) == "table" then return mod end
+  for _, p in ipairs({ "/home/lib/" .. name .. ".lua", "/usr/lib/" .. name .. ".lua",
+                       "/lib/" .. name .. ".lua", "lib/" .. name .. ".lua",
+                       name .. ".lua" }) do
+    local chunk = loadfile(p)
+    if chunk then
+      local okc, m = pcall(chunk)
+      if okc and type(m) == "table" then return m end
+    end
+  end
+  return nil
+end
+
+local env = loadModule("env")
 
 -- Must not exceed the proxy's CHUNK_BYTES budget.
 local CHUNK_BYTES = 4096
@@ -68,25 +92,49 @@ function http.getTimeout() return TIMEOUT end
 
 local discovered = nil
 
-local function proxyAddress()
-  if PROXY_ADDRESS ~= "PUT-PROXY-MODEM-ADDRESS-HERE" then return PROXY_ADDRESS end
-  if discovered then return discovered end
-
+-- Asks the network who the proxy is. proxy.lua answers a "discover" broadcast
+-- with its own address.
+local function discover()
   pcall(network.broadcast, PORT, "discover")
   local deadline = os.clock() + DISCOVER_TIMEOUT
   while os.clock() < deadline do
     local name, _, fromAddr, fromPort, _, msgType =
       event.pull(deadline - os.clock(), "modem_message")
     if name == nil then break end
-    if fromPort == PORT and msgType == "proxy_here" then
-      discovered = fromAddr
-      return discovered
-    end
+    if fromPort == PORT and msgType == "proxy_here" then return fromAddr end
   end
   return nil
 end
 
+local function proxyAddress()
+  if discovered then return discovered end
+
+  -- A hand-set address in /home/.env always wins.
+  if env then
+    local configured = env.get("PROXY_ADDRESS")
+    if configured then
+      discovered = configured
+      return discovered
+    end
+  end
+
+  local found = discover()
+  if not found then return nil end
+  discovered = found
+
+  -- Remember it, so this costs one broadcast ever rather than one per run.
+  -- Failing to write is not fatal; discovery simply repeats next time.
+  if env then pcall(env.set, "PROXY_ADDRESS", found) end
+  return discovered
+end
+
 http.proxyAddress = proxyAddress
+
+-- Forgets the cached address so the next request rediscovers. Useful after
+-- moving the proxy to a different computer.
+function http.forgetProxy()
+  discovered = nil
+end
 
 -- ==== REQUEST ID ================================================
 -- Used to match responses to the request that triggered them, in case
@@ -149,9 +197,9 @@ end
 local function sendRequest(reqTable)
   local address = proxyAddress()
   if not address then
-    return nil, "no proxy found. Set PROXY_ADDRESS at the top of http.lua to " ..
-                "the address proxy.lua prints on startup, and check the proxy " ..
-                "is running and on the same network."
+    return nil, "no proxy found. Check proxy.lua is running and on the same " ..
+                "network, or put its address in /home/.env as:\n" ..
+                "  PROXY_ADDRESS=<the address proxy.lua prints on startup>"
   end
 
   reqTable.id = newId()

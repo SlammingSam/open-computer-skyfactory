@@ -17,7 +17,7 @@ import os.path
 import sys
 from lupa import LuaRuntime
 
-SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "proxy.lua")
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "proxy.lua")
 
 lines = open(SRC, encoding="utf-8").read().split("\n")
 cut = next(i for i, l in enumerate(lines) if l.startswith("-- ==== MAIN LOOP"))

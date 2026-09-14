@@ -66,7 +66,7 @@ OLLAMA_HOST=0.0.0.0:11434 ollama serve
 
 ### 2. Point ollama.lua at it
 
-`OLLAMA_HOST` at the top of `ollama.lua` is the address **as seen from the
+`OLLAMA_HOST` (in `/home/.env`, or the default at the top of `bin/ollama.lua`) is the address **as seen from the
 proxy computer's Internet Card** — that request is made by the Minecraft
 server's JVM, so it is the server host's view of the network.
 
@@ -75,19 +75,21 @@ server's JVM, so it is the server host's view of the network.
 
 You can also change it live with `/host <url>` to test without editing files.
 
-### 3. Raise the HTTP timeout (recommended)
+### 3. Settings live in /home/.env
 
-`http.lua` ships with `local TIMEOUT = 30`. Local inference regularly runs
-past that, especially on the first request of a session while the model is
-still loading into VRAM. Change that one number:
+Copy `.env.example` to `/home/.env` and set whatever this machine needs. The
+updater never overwrites that file, so it survives every update:
 
-```lua
-local TIMEOUT = 180
+```
+OLLAMA_HOST=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen2.5:7b-instruct
+PROXY_ADDRESS=e66d90a3-...     # optional, discovered automatically if absent
 ```
 
-`ollama.lua` mitigates this on its own — it preloads the model at startup and
-caps replies at 600 tokens — but a long tool-heavy answer can still hit 30 s.
-If you see `request timed out after 30s`, this is why, and the app will say so.
+The HTTP timeout is handled for you: `ollama.lua` raises `http.lua`'s timeout
+to 180s on startup, because local inference regularly runs past a shorter one
+while the model loads into VRAM. Override it with `HTTP_TIMEOUT` in `.env` if
+you need something different.
 
 ### 4. Un-blacklist loopback (required — do this one)
 
@@ -135,7 +137,7 @@ does not surface the refusal — `read()` returns nothing and `response()`
 reports no status, so `proxy.lua` falls back to a hardcoded `200 OK`. A
 blocked request and a successful empty one look identical.
 
-Run `nettest.lua` on the proxy computer to see the real reason:
+Run `nettest` on the proxy computer to see the real reason:
 
 ```
 finishConnect -> nil, address is blacklisted
@@ -144,7 +146,7 @@ finishConnect -> nil, address is blacklisted
 The rest of this section covers causes that are already fixed in this repo,
 kept because the symptoms are easy to confuse.
 
-**Make sure `proxy.lua` on the proxy computer is this repo's version.**
+**Make sure `bin/proxy.lua` on the proxy computer is this repo's version**, and that `lib/http.lua` on the client matches it - they share a chunked wire format and must be updated together.
 
 `internet.request()` in OpenComputers is **asynchronous** — it hands back a
 handle before the connection exists. The original `proxy.lua` read from that
@@ -168,7 +170,7 @@ line now also reports the body size, so this failure is visible at the proxy:
 ```
 
 **If the proxy still logs `0 bytes` after updating**, that race was not your
-cause. Run `nettest.lua` **on the proxy computer**:
+cause. Run `bin/nettest.lua` **on the proxy computer**:
 
 ```
 nettest
@@ -206,7 +208,7 @@ it fits, so this is handled rather than fatal. What you will notice is the
 model forgetting earlier turns sooner than 8192 tokens of context implies.
 
 If you are running an `http.lua`/`proxy.lua` pair that **chunks** large
-messages, set `MAX_REQUEST_BYTES = nil` and only `NUM_CTX` will limit you.
+messages, set `MAX_REQUEST_BYTES = nil` in `bin/ollama.lua` and only `NUM_CTX` will limit you.
 
 ---
 
@@ -304,10 +306,10 @@ Turn it on for a task, not for a session.
 
 ## Testing
 
-`tests/harness.py` loads `ollama.lua` under stubbed OpenComputers APIs using a
+`tests/harness.py` loads `bin/ollama.lua` under stubbed OpenComputers APIs using a
 real Lua interpreter (`pip install lupa`) and exercises the JSON encoder, the
 request shape, word wrapping, history trimming, permission gating and the file
-tools — 47 checks, no Minecraft required.
+tools — no Minecraft required.
 
 ```bash
 pip install lupa

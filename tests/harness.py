@@ -5,11 +5,12 @@ so every previous change this session went to the user untested. lupa gives a
 real interpreter, so the pure-Lua parts (JSON shape, wrapping, history
 trimming) can actually be run before shipping.
 """
+import os
 import sys
 from lupa import LuaRuntime
 
 import os.path
-SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ollama.lua")
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "ollama.lua")
 
 # Everything above the argument-parsing block; the entry dispatch at the bottom
 # would try to start the chat UI, so it is replaced with an export table.
@@ -93,9 +94,13 @@ end
 
 local realLoadfile = loadfile
 loadfile = function(path)
-  if type(path) == "string" and path:match("http%.lua$") then
+  if type(path) ~= "string" then return nil end
+  if path:match("http%.lua$") then
     return function() return fakeHttp end
   end
+  -- Serve the real lib/ modules (json, env) from the repo.
+  local name = path:match("([%w_]+)%.lua$")
+  if name then return realLoadfile(_G.__libdir .. "/" .. name .. ".lua") end
   return nil
 end
 
@@ -103,6 +108,8 @@ os.sleep = function() end
 """
 
 lua = LuaRuntime(unpack_returned_tuples=False)
+lua.globals()["__libdir"] = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib").replace("\\", "/")
 lua.execute(PRELUDE)
 mod = lua.execute(body)
 if mod is None:

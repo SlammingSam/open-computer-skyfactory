@@ -96,10 +96,11 @@ local SYSTEM_PROMPT =
   "output is shown on a low-resolution in-game screen. Keep replies short."
 
 -- ============================== module loading ==============================
--- claude.lua does a bare dofile("http.lua"), which only works when the shell's
--- working directory happens to be the one holding http.lua. Look in the
--- directory this script was loaded from first, then the usual places, so
--- `ollama` works from anywhere.
+-- Everything shared lives in lib/. Modules are loaded by name so this file
+-- does not care whether the toolchain was installed to /home/lib, cloned
+-- somewhere else, or is sitting in the working directory. require() is tried
+-- first, so a normal OpenOS install just works; the explicit paths are the
+-- fallback for a copy run straight out of a clone.
 
 local function scriptDir()
   local ok, info = pcall(function() return debug.getinfo(1, "S") end)
@@ -108,240 +109,79 @@ local function scriptDir()
   return info.source:sub(2):match("^(.*)/[^/]*$")
 end
 
-local function loadHttp()
-  local tried, seen = {}, {}
-  local candidates = {}
-  local function add(p) if p and not seen[p] then seen[p] = true; candidates[#candidates + 1] = p end end
+local function loadModule(name)
+  local ok, mod = pcall(require, name)
+  if ok and type(mod) == "table" then return mod, "require(" .. name .. ")" end
+
+  local candidates, seen, tried = {}, {}, {}
+  local function add(p)
+    if p and not seen[p] then seen[p] = true; candidates[#candidates + 1] = p end
+  end
 
   local dir = scriptDir()
-  if dir then add(dir .. "/http.lua") end
-  if shell and shell.getWorkingDirectory then
-    local cwd = shell.getWorkingDirectory()
-    if cwd then add((cwd == "/" and "" or cwd) .. "/http.lua") end
+  if dir then
+    add(dir .. "/../lib/" .. name .. ".lua")  -- installed as bin/ beside lib/
+    add(dir .. "/" .. name .. ".lua")
   end
-  add("/home/http.lua")
-  add("/usr/lib/http.lua")
-  add("/lib/http.lua")
-  add("http.lua")
+  add("/home/lib/" .. name .. ".lua")
+  add("/usr/lib/" .. name .. ".lua")
+  add("/lib/" .. name .. ".lua")
+  add("lib/" .. name .. ".lua")
+  add(name .. ".lua")
 
-  for _, path in ipairs(candidates) do
-    local chunk = loadfile(path)
+  for _, p in ipairs(candidates) do
+    local chunk = loadfile(p)
     if chunk then
-      local ok, mod = pcall(chunk)
-      if ok and type(mod) == "table" and mod.post then return mod, path end
-      tried[#tried + 1] = path .. " (" .. tostring(mod):sub(1, 60) .. ")"
+      local okc, m = pcall(chunk)
+      if okc and type(m) == "table" then return m, p end
+      tried[#tried + 1] = p .. " (" .. tostring(m):sub(1, 50) .. ")"
     else
-      tried[#tried + 1] = path .. " (not found)"
+      tried[#tried + 1] = p .. " (not found)"
     end
   end
   return nil, table.concat(tried, "\n  ")
 end
 
-local http, httpPath = loadHttp()
-if not http then
-  print("ollama.lua: could not load http.lua. Looked in:\n  " .. tostring(httpPath))
-  print("\nPut http.lua next to ollama.lua, or in /home, and make sure its")
-  print("PROXY_ADDRESS is set to your proxy computer's modem address.")
+local json, jsonPath = loadModule("json")
+if not json then
+  print("ollama.lua: could not load lib/json.lua. Looked in:\n  " .. tostring(jsonPath))
+  print("\nRun the updater (update.lua) to install the library files, or copy")
+  print("lib/json.lua to /home/lib/json.lua.")
   return
 end
 
--- If http.lua has been given a timeout setter, use it: local model inference
--- regularly runs past its stock 30 s, especially on the first (cold) request.
--- Without the setter we cannot reach that local, so the fallback is to keep
--- NUM_PREDICT modest and tell the user what to change when a timeout happens.
-if type(http.setTimeout) == "function" then pcall(http.setTimeout, 180) end
-
--- ============================ minimal JSON library ==========================
--- Stock OpenComputers has no JSON library, and tool calling needs real
--- nested JSON (objects/arrays of arbitrary shape), so this is a small
--- general-purpose encoder/decoder rather than the old field-by-field
--- string scanning. Limitations: \u escapes above 127 decode to "?"
--- (no UTF-16 surrogate pair handling) - fine for our purposes.
-local json = {}
-
-local emptyObjectMeta = {} -- marks a table as "always encode as {}"
-function json.object(t)
-  return setmetatable(t or {}, emptyObjectMeta)
+local http, httpPath = loadModule("http")
+if not http then
+  print("ollama.lua: could not load lib/http.lua. Looked in:\n  " .. tostring(httpPath))
+  print("\nCopy lib/http.lua to /home/lib/http.lua, and put PROXY_ADDRESS in")
+  print("/home/.env (or let it discover the proxy automatically).")
+  return
 end
 
-local escapeMap = {
-  ['\\'] = '\\\\', ['"'] = '\\"', ['\n'] = '\\n',
-  ['\r'] = '\\r', ['\t'] = '\\t', ['\b'] = '\\b', ['\f'] = '\\f',
-}
-local function jsonEscape(s)
-  return (s:gsub('[%c\\"]', function(c)
-    return escapeMap[c] or string.format('\\u%04x', c:byte())
-  end))
-end
+-- Optional: without it the defaults above are simply used as written.
+local env = loadModule("env")
 
-local function isJsonArray(t)
-  if getmetatable(t) == emptyObjectMeta then return false, 0 end
-  local n = 0
-  for k in pairs(t) do
-    if type(k) ~= "number" then return false, 0 end
-    n = n + 1
-  end
-  for i = 1, n do
-    if t[i] == nil then return false, 0 end
-  end
-  return true, n
-end
+-- Machine-specific settings live in /home/.env so an update never overwrites
+-- them, and so a second computer can point at a different host or model
+-- without editing this file.
+if env then
+  OLLAMA_HOST = (env.get("OLLAMA_HOST", OLLAMA_HOST)):gsub("/+$", "")
+  MODEL       = env.get("OLLAMA_MODEL", MODEL)
+  NUM_CTX     = env.number("OLLAMA_NUM_CTX", NUM_CTX)
+  NUM_PREDICT = env.number("OLLAMA_NUM_PREDICT", NUM_PREDICT)
+  TEMPERATURE = env.number("OLLAMA_TEMPERATURE", TEMPERATURE)
 
-function json.encode(v)
-  local t = type(v)
-  if v == nil then
-    return "null"
-  elseif t == "boolean" or t == "number" then
-    return tostring(v)
-  elseif t == "string" then
-    return '"' .. jsonEscape(v) .. '"'
-  elseif t == "table" then
-    local isArr, n = isJsonArray(v)
-    if isArr then
-      if n == 0 then return "[]" end
-      local parts = {}
-      for i = 1, n do parts[i] = json.encode(v[i]) end
-      return "[" .. table.concat(parts, ",") .. "]"
-    else
-      local parts = {}
-      for k, val in pairs(v) do
-        parts[#parts + 1] = '"' .. jsonEscape(tostring(k)) .. '":' .. json.encode(val)
-      end
-      return "{" .. table.concat(parts, ",") .. "}"
-    end
-  else
-    error("json.encode: cannot encode a " .. t)
+  -- Derived from NUM_CTX, so it has to be recomputed after any override.
+  HISTORY_CHAR_BUDGET = NUM_CTX * 3 - 4000
+  if MAX_REQUEST_BYTES then
+    HISTORY_CHAR_BUDGET = math.min(HISTORY_CHAR_BUDGET, MAX_REQUEST_BYTES - 2400)
   end
 end
 
-local decodeValue, decodeObject, decodeArray, decodeString
-
-local function skipWs(s, i)
-  local _, e = s:find("^%s*", i)
-  return e + 1
-end
-
-decodeString = function(s, i)
-  i = i + 1 -- skip opening quote
-  local startI = i
-  local buf = {}
-  while true do
-    local c = s:sub(i, i)
-    if c == "" then error("unterminated string at " .. i) end
-    if c == '"' then
-      buf[#buf + 1] = s:sub(startI, i - 1)
-      return table.concat(buf), i + 1
-    elseif c == "\\" then
-      buf[#buf + 1] = s:sub(startI, i - 1)
-      local esc = s:sub(i + 1, i + 1)
-      if esc == "n" then buf[#buf + 1] = "\n"; i = i + 2
-      elseif esc == "t" then buf[#buf + 1] = "\t"; i = i + 2
-      elseif esc == "r" then buf[#buf + 1] = "\r"; i = i + 2
-      elseif esc == "b" then buf[#buf + 1] = "\b"; i = i + 2
-      elseif esc == "f" then buf[#buf + 1] = "\f"; i = i + 2
-      elseif esc == '"' then buf[#buf + 1] = '"'; i = i + 2
-      elseif esc == "\\" then buf[#buf + 1] = "\\"; i = i + 2
-      elseif esc == "/" then buf[#buf + 1] = "/"; i = i + 2
-      elseif esc == "u" then
-        local code = tonumber(s:sub(i + 2, i + 5), 16) or 63
-        buf[#buf + 1] = (code < 128) and string.char(code) or "?"
-        i = i + 6
-      else
-        buf[#buf + 1] = esc; i = i + 2
-      end
-      startI = i
-    else
-      i = i + 1
-    end
-  end
-end
-
-local function decodeNumber(s, i)
-  local j, n = i, #s
-  if s:sub(j, j) == "-" then j = j + 1 end
-  while j <= n and s:sub(j, j):match("%d") do j = j + 1 end
-  if s:sub(j, j) == "." then
-    j = j + 1
-    while j <= n and s:sub(j, j):match("%d") do j = j + 1 end
-  end
-  if s:sub(j, j) == "e" or s:sub(j, j) == "E" then
-    j = j + 1
-    if s:sub(j, j) == "+" or s:sub(j, j) == "-" then j = j + 1 end
-    while j <= n and s:sub(j, j):match("%d") do j = j + 1 end
-  end
-  return tonumber(s:sub(i, j - 1)), j
-end
-
-decodeObject = function(s, i)
-  i = i + 1 -- skip '{'
-  local obj = json.object({})
-  i = skipWs(s, i)
-  if s:sub(i, i) == "}" then return obj, i + 1 end
-  while true do
-    i = skipWs(s, i)
-    local key
-    key, i = decodeString(s, i)
-    i = skipWs(s, i)
-    if s:sub(i, i) ~= ":" then error("expected ':' at " .. i) end
-    i = skipWs(s, i + 1)
-    local val
-    val, i = decodeValue(s, i)
-    obj[key] = val
-    i = skipWs(s, i)
-    local c = s:sub(i, i)
-    if c == "," then
-      i = i + 1
-    elseif c == "}" then
-      return obj, i + 1
-    else
-      error("expected ',' or '}' at " .. i)
-    end
-  end
-end
-
-decodeArray = function(s, i)
-  i = i + 1 -- skip '['
-  local arr, n = {}, 0
-  i = skipWs(s, i)
-  if s:sub(i, i) == "]" then return arr, i + 1 end
-  while true do
-    i = skipWs(s, i)
-    local val
-    val, i = decodeValue(s, i)
-    n = n + 1
-    arr[n] = val
-    i = skipWs(s, i)
-    local c = s:sub(i, i)
-    if c == "," then
-      i = i + 1
-    elseif c == "]" then
-      return arr, i + 1
-    else
-      error("expected ',' or ']' at " .. i)
-    end
-  end
-end
-
-decodeValue = function(s, i)
-  i = skipWs(s, i)
-  local c = s:sub(i, i)
-  if c == '"' then return decodeString(s, i)
-  elseif c == "{" then return decodeObject(s, i)
-  elseif c == "[" then return decodeArray(s, i)
-  elseif c == "t" and s:sub(i, i + 3) == "true" then return true, i + 4
-  elseif c == "f" and s:sub(i, i + 4) == "false" then return false, i + 5
-  elseif c == "n" and s:sub(i, i + 3) == "null" then return nil, i + 4
-  elseif c == "-" or c:match("%d") then return decodeNumber(s, i)
-  else error("unexpected character '" .. c .. "' at " .. i) end
-end
-
-function json.decode(s)
-  local ok, val = pcall(function()
-    local v = decodeValue(s, 1)
-    return v
-  end)
-  if not ok then return nil, tostring(val) end
-  return val
+-- Local model inference regularly runs past http.lua's default timeout,
+-- especially on the first (cold) request while the model loads into VRAM.
+if type(http.setTimeout) == "function" then
+  pcall(http.setTimeout, env and env.number("HTTP_TIMEOUT", 180) or 180)
 end
 
 -- ============================== Ollama client ===============================
