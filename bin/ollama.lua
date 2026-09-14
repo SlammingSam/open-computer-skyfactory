@@ -100,6 +100,10 @@ local SYSTEM_PROMPT =
   "Check results before reporting success. If a tool says FAILED or returns " ..
   "an error, say what went wrong; do not assume the job is done. Verify a " ..
   "deletion or a write with list_files when it matters.\n\n" ..
+  "Read output literally. If it does not look like an answer to the question " ..
+  "— an address, a number, a list — then something is wrong with the code or " ..
+  "the command, and repeating it unchanged will not help. Say what you " ..
+  "actually got.\n\n" ..
   "Before writing code that calls a library on this machine, read that " ..
   "library with read_file and use the functions it actually defines, rather " ..
   "than guessing names.\n\n" ..
@@ -921,6 +925,7 @@ end
 local function runTurn(history, cb)
   cb = cb or {}
   local function status(s) if cb.onStatus then cb.onStatus(s) end end
+  local emptyRetried = false
 
   for iteration = 1, MAX_TOOL_ITERATIONS do
     local dropped = trimHistory(history)
@@ -957,52 +962,65 @@ local function runTurn(history, cb)
 
     if not hasCalls then
       local text = msg.content
-      if type(text) ~= "string" or not text:match("%S") then
-        -- A reply cut off at the token limit is the usual cause of a blank
-        -- one: the model was mid-sentence, or mid-tool-call, when it ran out.
-        if lastStats and lastStats.doneReason == "length" then
-          return nil, "the reply hit the " .. NUM_PREDICT .. "-token limit before " ..
-                      "the model said anything usable. Raise OLLAMA_NUM_PREDICT " ..
-                      "in /home/.env, or ask for something smaller."
+      if type(text) == "string" and text:match("%S") then
+        return text
+      end
+
+      -- A reply cut off at the token limit is one cause of a blank one: the
+      -- model was mid-sentence, or mid-tool-call, when it ran out.
+      if lastStats and lastStats.doneReason == "length" then
+        return nil, "the reply hit the " .. NUM_PREDICT .. "-token limit before " ..
+                    "the model said anything usable. Raise OLLAMA_NUM_PREDICT " ..
+                    "in /home/.env, or ask for something smaller."
+      end
+
+      if emptyRetried then
+        return nil, "the model returned an empty reply twice — try rephrasing, " ..
+                    "or /new to reset"
+      end
+
+      -- Otherwise it simply produced nothing, which small local models do
+      -- occasionally even on a question they can answer. One resample costs a
+      -- second and usually works; making the user retype the question does not.
+      emptyRetried = true
+      history[#history] = nil  -- an empty assistant turn only confuses the retry
+      status("the model said nothing — asking again")
+
+    else
+      -- Several models narrate their plan in the same message as the tool call.
+      -- That text is worth showing rather than silently dropping.
+      if type(msg.content) == "string" and msg.content:match("%S") and cb.onAssistantNote then
+        cb.onAssistantNote(msg.content)
+      end
+
+      for _, call in ipairs(calls) do
+        local fn = (type(call) == "table" and call["function"]) or {}
+        local name = tostring(fn.name or "?")
+        local args = normaliseArgs(fn.arguments)
+
+        if cb.onToolCall then cb.onToolCall(name, args) end
+
+        local allowed = true
+        if NEEDS_CONFIRMATION[name] and not UNSAFE then
+          allowed = (cb.confirm ~= nil) and cb.confirm(name, args) or false
         end
-        return nil, "the model returned an empty reply — try rephrasing, or /new to reset"
+
+        local result
+        local impl = TOOL_IMPL[name]
+        if not impl then
+          result = { error = "unknown tool: " .. name }
+        elseif not allowed then
+          result = { error = "the user denied permission for this tool call" }
+        else
+          status("running " .. name .. "…")
+          local ok, res = pcall(impl, args)
+          result = (ok and type(res) == "table") and res or { error = tostring(res) }
+        end
+
+        local text = resultToText(result)
+        if cb.onToolResult then cb.onToolResult(name, text, result.error ~= nil) end
+        history[#history + 1] = { role = "tool", content = text, tool_name = name }
       end
-      return text
-    end
-
-    -- Several models narrate their plan in the same message as the tool call.
-    -- That text is worth showing rather than silently dropping.
-    if type(msg.content) == "string" and msg.content:match("%S") and cb.onAssistantNote then
-      cb.onAssistantNote(msg.content)
-    end
-
-    for _, call in ipairs(calls) do
-      local fn = (type(call) == "table" and call["function"]) or {}
-      local name = tostring(fn.name or "?")
-      local args = normaliseArgs(fn.arguments)
-
-      if cb.onToolCall then cb.onToolCall(name, args) end
-
-      local allowed = true
-      if NEEDS_CONFIRMATION[name] and not UNSAFE then
-        allowed = (cb.confirm ~= nil) and cb.confirm(name, args) or false
-      end
-
-      local result
-      local impl = TOOL_IMPL[name]
-      if not impl then
-        result = { error = "unknown tool: " .. name }
-      elseif not allowed then
-        result = { error = "the user denied permission for this tool call" }
-      else
-        status("running " .. name .. "…")
-        local ok, res = pcall(impl, args)
-        result = (ok and type(res) == "table") and res or { error = tostring(res) }
-      end
-
-      local text = resultToText(result)
-      if cb.onToolResult then cb.onToolResult(name, text, result.error ~= nil) end
-      history[#history + 1] = { role = "tool", content = text, tool_name = name }
     end
   end
 
@@ -1061,7 +1079,11 @@ local function describeModule(name, mod)
   if type(mod) ~= "table" then return nil end
   local fns = {}
   for k, v in pairs(mod) do
-    if type(v) == "function" then fns[#fns + 1] = k end
+    -- Written with parentheses. Listed as bare words, they get pasted into
+    -- code as bare words: the model wrote require("http").proxyAddress, which
+    -- prints the function rather than calling it, and then read the result as
+    -- an answer.
+    if type(v) == "function" then fns[#fns + 1] = k .. "()" end
   end
   if #fns == 0 then return nil end
   table.sort(fns)

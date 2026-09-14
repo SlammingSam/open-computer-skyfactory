@@ -298,14 +298,16 @@ THIS COMPUTER RIGHT NOW
 - No Internet Card here. Network access goes through the proxy computer.
 - Working directory: /home
 - Libraries available here, and the functions they actually have:
-    http: forgetProxy, get, getTimeout, post, proxyAddress, setTimeout
-    json: decode, encode, object
-    env: bool, get, load, number, present, reload, set
+    http: forgetProxy(), get(), getTimeout(), post(), proxyAddress(), setTimeout()
+    json: decode(), encode(), object()
+    env: bool(), defaultPath(), get(), load(), number(), path(), present(), reload(), set()
 ```
 
 That last part is the one that earns its keep — the model is given the real
 function names instead of guessing them, and told to `read_file` anything else
-before using it.
+before using it. They are listed *with parentheses* deliberately: written as
+bare words they get pasted into code as bare words, and `http.proxyAddress`
+without the call prints the function rather than the address.
 
 `/prompt` shows the whole thing and what it costs per request. `OLLAMA_OC_BRIEF`
 in `.env` forces it on or off; by default it is included when the context window

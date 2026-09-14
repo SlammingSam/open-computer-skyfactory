@@ -512,6 +512,42 @@ check("the final pass is sent WITHOUT tools, so it must answer in words",
       mod["lastRequest"]()["payload"][:120])
 mod["setMaxSteps"](10)
 
+print("== an empty turn is resampled, not surfaced ==")
+# Observed in use: asked a question answerable straight from the system prompt,
+# the model returned a completely empty turn and the user got an error. Small
+# local models do this occasionally; one resample is cheaper than making them
+# retype the question.
+mod["setReplies"](lua.eval(r"""{
+  '{"message":{"role":"assistant","content":""},"done":true}',
+  '{"message":{"role":"assistant","content":"4096 KB, with a modem attached."},"done":true}'
+}"""))
+h5 = newHistory()
+lua.globals()["__push"](h5, "user", "how much memory is there")
+reply = mod["runTurn"](h5, lua.eval("{ onStatus = function() end }"))
+check("a single empty turn is retried and the answer comes back",
+      reply == "4096 KB, with a modem attached.", reply)
+roles5 = [h5[i]["role"] for i in range(1, len(h5) + 1)]
+check("the empty turn is not left in the history",
+      roles5 == ["system", "user", "assistant"], roles5)
+
+mod["setReplies"](lua.eval(r"""{
+  '{"message":{"role":"assistant","content":""},"done":true}',
+  '{"message":{"role":"assistant","content":"   "},"done":true}'
+}"""))
+h6 = newHistory()
+lua.globals()["__push"](h6, "user", "say nothing twice")
+res = mod["runTurn"](h6, lua.eval("{ onStatus = function() end }"))
+err = res[1] if isinstance(res, tuple) else None
+check("two empty turns in a row give up and say so",
+      err is not None and "twice" in err, err)
+
+print("== library functions are listed as calls ==")
+desc = mod["describeModule"]("http", mod["json"])
+check("function names carry parentheses, so they get pasted as calls",
+      "encode()" in desc, desc)
+check("the whole listing does, not just the first",
+      desc.count("()") >= 2, desc)
+
 print("== a reply cut off at the token limit says so ==")
 mod["setReplies"](lua.eval(r"""{
   '{"message":{"role":"assistant","content":""},"done":true,"done_reason":"length"}'
