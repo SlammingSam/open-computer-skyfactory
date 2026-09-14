@@ -77,9 +77,10 @@ local stubs = {
     modem = {
       address = "fake-modem",
       open = function() end,
-      send = function(addr, port, kind, payload)
-        _G.__sent[#_G.__sent + 1] = payload
+      send = function(addr, port, kind, a, b, c, d, e)
+        _G.__sent[#_G.__sent + 1] = { kind = kind, a = a, b = b, c = c, d = d, e = e }
       end,
+      broadcast = function() return true end,
     },
   },
   event = { pull = function() return nil end, listen = function() return true end },
@@ -214,29 +215,36 @@ def reset_sent():
         sent[len(sent)] = None
 
 
-# Headers on an API response can outweigh the body; dropping them should
-# rescue a reply that would otherwise be refused outright.
-reset_sent()
-big_headers = {"h%03d" % i: "x" * 200 for i in range(100)}
-mod["sendTo"]("addr", "response", lua.table_from({
-    "id": "7", "body": "the real payload", "headers": lua.table_from(big_headers)}))
-payload = G["__sent"][1]
-check("headers are dropped to fit rather than losing the reply",
-      "body=the real payload" in payload and len(payload) <= 8192, len(payload))
-check("dropping headers actually removed them",
-      "h001" not in payload, payload[:80])
+def sent_packets():
+    out = []
+    for i in range(1, len(G["__sent"]) + 1):
+        p = G["__sent"][i]
+        out.append({k: p[k] for k in ("kind", "a", "b", "c", "d", "e")})
+    return out
 
+
+# A reply bigger than one packet must be chunked, not refused and not handed
+# whole to a modem that would drop it. This is the failure that made a 4 KB
+# GitHub tree vanish between a successful fetch and the client's timeout.
 reset_sent()
-mod["sendTo"]("addr", "response", lua.table_from({"id": "8", "body": "x" * 9000}))
-payload = G["__sent"][1]
-check("a reply too big even without headers becomes an error",
-      "error=" in payload and len(payload) < 8192, len(payload))
-check("the error reply keeps the request id so the client can match it",
-      "id=8" in payload, payload[:60])
+mod["sendTo"]("addr", "response", lua.table_from({"id": "8", "body": "x" * 30000}))
+packets = sent_packets()
+check("a reply larger than one packet is chunked", len(packets) > 1, len(packets))
+check("chunks are labelled as chunks", all(p["kind"] == "chunk" for p in packets))
+check("each chunk carries its position and total",
+      packets[0]["c"] == 1 and packets[0]["d"] == len(packets),
+      (packets[0]["c"], packets[0]["d"]))
+check("no chunk payload approaches the modem limit",
+      all(len(p["e"]) <= 4096 for p in packets),
+      max(len(p["e"]) for p in packets))
 
 reset_sent()
 mod["sendTo"]("addr", "response", lua.table_from({"id": "9", "body": "small"}))
-check("a normal reply passes through untouched", "body=small" in G["__sent"][1], G["__sent"][1])
+packets = sent_packets()
+check("a small reply is still one plain response message",
+      len(packets) == 1 and packets[0]["kind"] == "response", packets)
+check("a normal reply passes through untouched",
+      "body=small" in packets[0]["a"], packets[0]["a"])
 
 print("== misc ==")
 check("an empty allowlist allows everyone", mod["isAllowed"]("anything") is True)

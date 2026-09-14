@@ -6,9 +6,24 @@
 -- request description and waits for the reply.
 --
 -- Usage:
---   local http = require("http") -- or dofile("http.lua") depending on setup
---   local body, err = http.get("https://example.com")
---   local body, err = http.post("https://example.com/api", "some=data", {["Content-Type"]="application/x-www-form-urlencoded"})
+--   local http = dofile("http.lua")
+--   local body, err, status, headers = http.get("https://example.com")
+--   local body, err = http.post("https://example.com/api", "some=data",
+--                               {["Content-Type"]="application/json"})
+--   http.setTimeout(180)       -- for slow endpoints, e.g. local LLM inference
+--
+-- Pair this with the matching proxy.lua. They share a wire format, and an old
+-- copy of either will only handle small messages.
+--
+-- WHY THIS IS NOT THE ORIGINAL
+--
+-- CHUNKING. A modem drops any message over 8192 bytes, and a rack relays
+-- packets with a per-tick budget and a bounded queue, so even a legal message
+-- can be dropped in transit when it arrives as a burst. Requests are tiny and
+-- always land; replies are not. That asymmetry is why a small page worked
+-- while a 4 KB API response silently never arrived, and why the failure looked
+-- like a timeout rather than an error. Both directions now split large
+-- payloads into numbered chunks and reassemble them.
 --
 -- NOTE: see proxy.lua for why component.modem is aliased as "network" and
 -- the "serialization" library is aliased as "text" here.
@@ -22,23 +37,109 @@ assert(component.isAvailable("modem"), "This computer needs a Network Card")
 local network = component.modem -- alias: modem == "network card"
 
 -- ==== CONFIG ====================================================
--- Set this to the proxy computer's modem address (printed on proxy startup,
--- or run `address` on the proxy machine).
+-- The proxy computer's modem address, printed on proxy startup. Leaving this
+-- as the placeholder is fine: the client asks the network who the proxy is on
+-- first use, so this file can be replaced without losing your setup.
 local PROXY_ADDRESS = "PUT-PROXY-MODEM-ADDRESS-HERE"
-local PORT = 123      -- must match PORT in proxy.lua
-local TIMEOUT = 30    -- seconds to wait for a response before giving up
+
+local PORT = 123       -- must match PORT in proxy.lua
+local TIMEOUT = 90     -- seconds to wait for a response before giving up
+local DISCOVER_TIMEOUT = 3
+
+-- Must not exceed the proxy's CHUNK_BYTES budget.
+local CHUNK_BYTES = 4096
+local CHUNK_DELAY = 0.05
 
 network.open(PORT)
 
 local http = {}
+
+-- Local model inference regularly runs past a short timeout, so callers need
+-- to be able to raise it without editing this file.
+function http.setTimeout(seconds)
+  local n = tonumber(seconds)
+  if n and n > 0 then TIMEOUT = n end
+  return TIMEOUT
+end
+
+function http.getTimeout() return TIMEOUT end
+
+-- ==== PROXY DISCOVERY ===========================================
+
+local discovered = nil
+
+local function proxyAddress()
+  if PROXY_ADDRESS ~= "PUT-PROXY-MODEM-ADDRESS-HERE" then return PROXY_ADDRESS end
+  if discovered then return discovered end
+
+  pcall(network.broadcast, PORT, "discover")
+  local deadline = os.clock() + DISCOVER_TIMEOUT
+  while os.clock() < deadline do
+    local name, _, fromAddr, fromPort, _, msgType =
+      event.pull(deadline - os.clock(), "modem_message")
+    if name == nil then break end
+    if fromPort == PORT and msgType == "proxy_here" then
+      discovered = fromAddr
+      return discovered
+    end
+  end
+  return nil
+end
+
+http.proxyAddress = proxyAddress
 
 -- ==== REQUEST ID ================================================
 -- Used to match responses to the request that triggered them, in case
 -- multiple requests are in flight or stray messages show up.
 local nextId = 0
 local function newId()
-    nextId = nextId + 1
-    return tostring(os.time()) .. "-" .. tostring(nextId)
+  nextId = nextId + 1
+  return tostring(os.time()) .. "-" .. tostring(nextId)
+end
+
+-- ==== CHUNKED TRANSPORT =========================================
+
+local function sendSerialized(address, kind, serialized)
+  if #serialized <= CHUNK_BYTES then
+    return pcall(network.send, address, PORT, kind, serialized)
+  end
+
+  local id = newId()
+  local total = math.ceil(#serialized / CHUNK_BYTES)
+  for i = 1, total do
+    local part = serialized:sub((i - 1) * CHUNK_BYTES + 1, i * CHUNK_BYTES)
+    local ok, err = pcall(network.send, address, PORT, "chunk", kind, id, i, total, part)
+    if not ok then return false, err end
+    -- Let a rack relay drain instead of overflowing its queue.
+    if i < total then os.sleep(CHUNK_DELAY) end
+  end
+  return true
+end
+
+-- Reassembles inbound response chunks. Returns a complete payload string when
+-- the final piece arrives, nil otherwise.
+local inbound = {}
+
+local function collectChunk(kind, id, seq, total, data)
+  if kind ~= "response" then return nil end
+  seq, total = math.floor(tonumber(seq) or 0), math.floor(tonumber(total) or 0)
+  if seq < 1 or total < 1 then return nil end
+
+  local slot = inbound[id]
+  if not slot then
+    slot = { total = total, got = 0, parts = {} }
+    inbound[id] = slot
+  end
+  if not slot.parts[seq] then
+    slot.parts[seq] = data
+    slot.got = slot.got + 1
+  end
+
+  if slot.got >= slot.total then
+    inbound[id] = nil
+    return table.concat(slot.parts)
+  end
+  return nil
 end
 
 -- ==== CORE SEND/WAIT LOGIC ======================================
@@ -46,42 +147,51 @@ end
 -- matching response arrives. Returns the decoded response table, or
 -- nil + error string on failure/timeout.
 local function sendRequest(reqTable)
-    if PROXY_ADDRESS == "PUT-PROXY-MODEM-ADDRESS-HERE" then
-        return nil, "PROXY_ADDRESS not configured - edit the top of http.lua"
+  local address = proxyAddress()
+  if not address then
+    return nil, "no proxy found. Set PROXY_ADDRESS at the top of http.lua to " ..
+                "the address proxy.lua prints on startup, and check the proxy " ..
+                "is running and on the same network."
+  end
+
+  reqTable.id = newId()
+
+  local ok, err = sendSerialized(address, "request", text.serialize(reqTable))
+  if not ok then
+    return nil, "failed to send request: " .. tostring(err)
+  end
+
+  local startTime = os.clock()
+  while true do
+    local remaining = TIMEOUT - (os.clock() - startTime)
+    if remaining <= 0 then
+      return nil, "request timed out after " .. TIMEOUT .. "s"
     end
 
-    reqTable.id = newId()
+    local name, _, fromAddr, fromPort, _, msgType, a, b, c, d, e =
+      event.pull(remaining, "modem_message")
 
-    local ok, err = pcall(network.send, PROXY_ADDRESS, PORT, "request", text.serialize(reqTable))
-    if not ok then
-        return nil, "failed to send request: " .. tostring(err)
+    if name == nil then
+      return nil, "request timed out after " .. TIMEOUT .. "s"
     end
 
-    local startTime = os.clock()
-    while true do
-        local elapsed = os.clock() - startTime
-        local remaining = TIMEOUT - elapsed
-        if remaining <= 0 then
-            return nil, "request timed out after " .. TIMEOUT .. "s"
-        end
+    if fromAddr == address and fromPort == PORT then
+      local payload = nil
+      if msgType == "response" then
+        payload = a
+      elseif msgType == "chunk" then
+        payload = collectChunk(a, b, c, d, e)
+      end
 
-        local name, _, fromAddr, fromPort, _, msgType, payload =
-            event.pull(remaining, "modem_message")
-
-        if name == nil then
-            return nil, "request timed out after " .. TIMEOUT .. "s"
+      if payload then
+        local okDecode, data = pcall(text.unserialize, payload)
+        if okDecode and type(data) == "table" and data.id == reqTable.id then
+          return data
         end
-
-        if fromAddr == PROXY_ADDRESS and fromPort == PORT and msgType == "response" then
-            local okDecode, data = pcall(text.unserialize, payload)
-            if okDecode and type(data) == "table" and data.id == reqTable.id then
-                return data
-            end
-            -- else: not JSON/serialized correctly, or belongs to a
-            -- different request - keep waiting
-        end
-        -- any other modem_message traffic is ignored and we loop again
+        -- Not ours, or not decodable - keep waiting for one that is.
+      end
     end
+  end
 end
 
 -- ==== PUBLIC API =================================================
@@ -89,36 +199,36 @@ end
 -- http.get(url, headers)
 -- Returns: body, err, status, headers
 function http.get(url, headers)
-    local resp, err = sendRequest({
-        method = "GET",
-        url = url,
-        headers = headers or {},
-    })
-    if not resp then
-        return nil, err
-    end
-    if resp.error then
-        return nil, resp.error
-    end
-    return resp.body, nil, resp.status, resp.headers
+  local resp, err = sendRequest({
+    method = "GET",
+    url = url,
+    headers = headers or {},
+  })
+  if not resp then
+    return nil, err
+  end
+  if resp.error then
+    return nil, resp.error
+  end
+  return resp.body, nil, resp.status, resp.headers
 end
 
 -- http.post(url, body, headers)
 -- Returns: body, err, status, headers
 function http.post(url, body, headers)
-    local resp, err = sendRequest({
-        method = "POST",
-        url = url,
-        body = body or "",
-        headers = headers or {},
-    })
-    if not resp then
-        return nil, err
-    end
-    if resp.error then
-        return nil, resp.error
-    end
-    return resp.body, nil, resp.status, resp.headers
+  local resp, err = sendRequest({
+    method = "POST",
+    url = url,
+    body = body or "",
+    headers = headers or {},
+  })
+  if not resp then
+    return nil, err
+  end
+  if resp.error then
+    return nil, resp.error
+  end
+  return resp.body, nil, resp.status, resp.headers
 end
 
 return http
