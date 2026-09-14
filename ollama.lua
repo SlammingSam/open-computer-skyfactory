@@ -61,13 +61,27 @@ local KEEP_ALIVE = "30m"
 -- run forever on the slow in-game network.
 local MAX_TOOL_ITERATIONS = 10
 
--- Tool output longer than this is truncated before being sent back to the
--- model, to keep messages small over the modem and inside NUM_CTX.
-local MAX_TOOL_OUTPUT_CHARS = 3000
+-- Hard ceiling on one outgoing request, in bytes. OpenComputers' modem drops
+-- any message over 8192 bytes, and the reference http.lua / proxy.lua pair
+-- sends each request as a single modem message, so the whole serialized
+-- request has to fit. This is the real constraint on conversation length here
+-- — it bites long before NUM_CTX does. Requests are trimmed to fit
+-- automatically. Set to nil if your http.lua and proxy.lua chunk large
+-- messages, in which case only NUM_CTX matters.
+local MAX_REQUEST_BYTES = 7600
 
--- Conversation trimming budget, in characters. Roughly NUM_CTX * 3 characters
--- per token, minus headroom for the system prompt, tool schemas and the reply.
+-- Tool output longer than this is truncated before being sent back to the
+-- model. Kept well under MAX_REQUEST_BYTES so that a single file read cannot
+-- fill an entire request on its own.
+local MAX_TOOL_OUTPUT_CHARS = 1800
+
+-- Conversation trimming budget, in characters: whichever of the context window
+-- and the transport limit binds first. The tool schemas and system prompt cost
+-- roughly 2,400 bytes of every request before any conversation is added.
 local HISTORY_CHAR_BUDGET = NUM_CTX * 3 - 4000
+if MAX_REQUEST_BYTES then
+  HISTORY_CHAR_BUDGET = math.min(HISTORY_CHAR_BUDGET, MAX_REQUEST_BYTES - 2400)
+end
 
 local SYSTEM_PROMPT =
   "You are a terminal assistant running on an OpenComputers computer inside " ..
@@ -350,6 +364,11 @@ local function explainNetworkError(err)
   if err:find("PROXY_ADDRESS not configured") then
     return err .. "\nSet it to the modem address proxy.lua prints on startup."
   end
+  if err:find("too big") or err:find("8192") then
+    return err .. "\nOne modem message caps at 8192 bytes. Lower " ..
+           "MAX_REQUEST_BYTES in ollama.lua, or use an http.lua/proxy.lua " ..
+           "pair that chunks large messages."
+  end
   if err:find("connect") or err:find("refused") or err:find("denied") then
     return err .. "\nCheck Ollama is running and reachable at " .. OLLAMA_HOST ..
            " from the machine hosting the Minecraft server, and that OpenComputers'" ..
@@ -358,12 +377,30 @@ local function explainNetworkError(err)
   return err
 end
 
--- POST a JSON body and decode the reply. Returns table, nil on success.
-local function postJson(path, bodyTable)
-  local payload = json.encode(bodyTable)
-  local respBody, err, status = http.post(OLLAMA_HOST .. path, payload, JSON_HEADERS)
-  if not respBody then
-    return nil, explainNetworkError(err)
+-- An empty body is NOT a parsing problem, and reporting it as one sends you
+-- looking in the wrong place. OpenComputers' Internet Card does not expose the
+-- body of an error response, and proxy.lua falls back to "200 OK" when
+-- handle.response() tells it nothing — so a refused or blocked connection
+-- arrives here as a successful, completely empty reply. Say so plainly.
+local function emptyBodyError(status)
+  local hostOnly = OLLAMA_HOST:match("^https?://([^/]+)") or OLLAMA_HOST
+  return "empty reply from " .. OLLAMA_HOST .. " (reported as HTTP " ..
+    tostring(status or "?") .. ").\n" ..
+    "The proxy answered with no body at all, which almost always means the " ..
+    "request never reached Ollama rather than that Ollama replied strangely.\n" ..
+    "Check in this order:\n" ..
+    "1. The proxy computer's screen. It logs every URL and either a status or " ..
+    "an ERROR line. That single line tells you which half of the chain broke.\n" ..
+    "2. On the machine hosting the Minecraft server, run:  curl " ..
+    OLLAMA_HOST .. "/api/tags\n" ..
+    "3. opencomputers.cfg, internet section: enableHttp must be true, and the " ..
+    "blacklist must not cover " .. hostOnly .. ". OpenComputers ships blocking " ..
+    "loopback and private addresses, which is exactly what a local Ollama is."
+end
+
+local function decodeBody(respBody, status)
+  if type(respBody) ~= "string" or not respBody:match("%S") then
+    return nil, emptyBodyError(status)
   end
   local data, decodeErr = json.decode(respBody)
   if type(data) ~= "table" then
@@ -379,18 +416,37 @@ local function postJson(path, bodyTable)
   return data
 end
 
+local function postPayload(path, payload)
+  local respBody, err, status = http.post(OLLAMA_HOST .. path, payload, JSON_HEADERS)
+  if not respBody then
+    return nil, explainNetworkError(err)
+  end
+  return decodeBody(respBody, status)
+end
+
+-- POST a JSON body and decode the reply. Returns table, nil on success.
+local function postJson(path, bodyTable)
+  return postPayload(path, json.encode(bodyTable))
+end
+
 local function getJson(path)
   local respBody, err, status = http.get(OLLAMA_HOST .. path)
   if not respBody then return nil, explainNetworkError(err) end
-  local data, decodeErr = json.decode(respBody)
-  if type(data) ~= "table" then
-    return nil, "could not parse Ollama's reply: " .. tostring(decodeErr)
+  return decodeBody(respBody, status)
+end
+
+-- Raw probe behind /diag: reports exactly what came back rather than trying to
+-- make sense of it, so a broken chain can be located without guessing.
+local function probeRaw(path)
+  local respBody, err, status = http.get(OLLAMA_HOST .. path)
+  if not respBody then
+    return "GET " .. OLLAMA_HOST .. path .. "\n  failed: " .. tostring(err)
   end
-  if data.error then return nil, "Ollama: " .. tostring(data.error) end
-  if status and status ~= 200 then
-    return nil, "Ollama returned HTTP " .. tostring(status)
-  end
-  return data
+  local preview = respBody:sub(1, 120):gsub("[\r\n]", " ")
+  return "GET " .. OLLAMA_HOST .. path ..
+    "\n  status: " .. tostring(status or "(none reported)") ..
+    "\n  body:   " .. #respBody .. " bytes" ..
+    (#respBody > 0 and ("\n  starts: " .. preview) or "  <- empty")
 end
 
 -- Lists installed models. Doubles as the startup reachability check, since it
@@ -406,25 +462,56 @@ local function listModels()
   return names
 end
 
--- Sends one chat turn. `messages` is the full history array.
-local function ollamaChat(messages, tools)
-  local body = {
-    model = MODEL,
-    messages = messages,
-    -- Non-negotiable: streaming replies are newline-delimited JSON, and
-    -- proxy.lua hands back the whole concatenated body, which is not valid
-    -- JSON as a single document.
-    stream = false,
-    keep_alive = KEEP_ALIVE,
-    options = json.object({
-      num_ctx = NUM_CTX,
-      num_predict = NUM_PREDICT,
-      temperature = TEMPERATURE,
-    }),
-  }
-  if tools and #tools > 0 then body.tools = tools end
+-- Drops the oldest droppable message, keeping the system prompt at index 1 and
+-- never leaving a tool result without the assistant turn that requested it —
+-- Ollama rejects that outright. Returns false when there is nothing left to
+-- give up.
+local function dropOldestMessage(messages)
+  if #messages <= 2 then return false end
+  table.remove(messages, 2)
+  while #messages > 2 and messages[2].role == "tool" do
+    table.remove(messages, 2)
+  end
+  return true
+end
 
-  local data, err = postJson("/api/chat", body)
+-- Sends one chat turn. `messages` is the full history array, trimmed in place
+-- if the encoded request will not fit through the modem.
+local function ollamaChat(messages, tools)
+  local function buildBody()
+    local body = {
+      model = MODEL,
+      messages = messages,
+      -- Non-negotiable: streaming replies are newline-delimited JSON, and
+      -- proxy.lua hands back the whole concatenated body, which is not valid
+      -- JSON as a single document.
+      stream = false,
+      keep_alive = KEEP_ALIVE,
+      options = json.object({
+        num_ctx = NUM_CTX,
+        num_predict = NUM_PREDICT,
+        temperature = TEMPERATURE,
+      }),
+    }
+    if tools and #tools > 0 then body.tools = tools end
+    return json.encode(body)
+  end
+
+  -- Measure the real encoded request rather than estimating from character
+  -- counts. Estimating is what let an oversized request reach the modem in the
+  -- first place; this cannot be wrong about its own payload.
+  local payload = buildBody()
+  while MAX_REQUEST_BYTES and #payload > MAX_REQUEST_BYTES do
+    if not dropOldestMessage(messages) then
+      return nil, "this request is " .. #payload .. " bytes, over the " ..
+        MAX_REQUEST_BYTES .. "-byte limit one modem message can carry, and " ..
+        "there is nothing older left to drop.\nShorten the question, or raise " ..
+        "MAX_REQUEST_BYTES if your http.lua and proxy.lua chunk large messages."
+    end
+    payload = buildBody()
+  end
+
+  local data, err = postPayload("/api/chat", payload)
   if not data then return nil, err end
   if type(data.message) ~= "table" then
     return nil, "Ollama replied without a message field"
@@ -1437,6 +1524,7 @@ local HELP_TEXT =
   "  /models          list models installed on the Ollama host\n" ..
   "  /host <url>      point at a different Ollama instance\n" ..
   "  /tools           list the tools the model can call\n" ..
+  "  /diag            probe the connection and report exactly what came back\n" ..
   "  /unsafe          toggle skipping permission prompts\n" ..
   "  /save <path>     write this conversation to a file\n" ..
   "  /help            this list\n" ..
@@ -1503,6 +1591,14 @@ local function runCommand(line)
         "\n      " .. f.description
     end
     addEntry("info", "Tools available to the model:\n" .. table.concat(names, "\n"))
+
+  elseif cmd == "/diag" then
+    addEntry("info", "Probing " .. OLLAMA_HOST .. " through " .. tostring(httpPath) ..
+                     "\nWatch the proxy computer's screen while this runs.")
+    render()
+    addEntry("info", probeRaw("/api/tags"))
+    addEntry("info", probeRaw("/api/version"))
+    setStatus("probe finished - compare the above with the proxy's own log", "info")
 
   elseif cmd == "/unsafe" then
     UNSAFE = not UNSAFE
