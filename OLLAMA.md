@@ -91,9 +91,65 @@ If you see `request timed out after 30s`, this is why, and the app will say so.
 
 ### 4. If OpenComputers refuses to connect
 
-OpenComputers can be configured to block private and loopback addresses. In
-`opencomputers.cfg`, under `internet`, make sure `enableHttp=true` and that
-your Ollama address is not caught by `blacklist`.
+OpenComputers ships blocking **loopback and private addresses** — which is
+exactly what a local Ollama is. In `opencomputers.cfg`, under `internet`, make
+sure `enableHttp=true` and that your Ollama address is not caught by
+`blacklist`. This is the most likely reason a local instance is unreachable.
+
+---
+
+## Troubleshooting
+
+### "Could not reach Ollama — empty reply"
+
+**Update `proxy.lua` on the proxy computer and restart it.** This repo's
+version fixes the cause.
+
+`internet.request()` in OpenComputers is **asynchronous** — it hands back a
+handle before the connection exists. The original `proxy.lua` read from that
+handle immediately, and OC returns `nil` from `read()` on a request that is not
+ready yet, which the read loop could not tell apart from end-of-stream. The
+result was a request that looked completely successful but carried an empty
+body, with the status defaulting to `200 OK` because `handle.response()` also
+had nothing to say yet.
+
+Remote HTTPS hosts happened to win that race, which is why GitHub clones and
+the browser worked. A local Ollama on `127.0.0.1` answers fast enough to lose
+it every time.
+
+The fix waits on `finishConnect()` before reading, and treats an empty-string
+read as "nothing buffered yet" rather than as the end of the stream. The log
+line now also reports the body size, so this failure is visible at the proxy:
+
+```
+[proxy]   -> 200 OK, 1523 bytes
+[proxy]   -> 200 OK, 0 bytes  (status not reported by the card - assumed)
+```
+
+If it still fails after updating, in order:
+
+1. `curl http://127.0.0.1:11434/api/tags` **on the machine hosting the
+   Minecraft server** — not your desktop, if those are different boxes.
+2. The `opencomputers.cfg` blacklist above.
+
+`/diag` inside the app probes the connection and reports the status, body
+length and first bytes of what actually came back, instead of trying to
+interpret it.
+
+### Long conversations failing
+
+An OpenComputers modem drops any message over **8192 bytes**, and the reference
+`http.lua` / `proxy.lua` send each request as a single modem message — so the
+whole serialized request has to fit. In practice this binds long before
+`NUM_CTX` does: the tool schemas and system prompt alone cost ~2.4 KB of every
+request.
+
+`ollama.lua` measures the encoded payload and trims the oldest messages until
+it fits, so this is handled rather than fatal. What you will notice is the
+model forgetting earlier turns sooner than 8192 tokens of context implies.
+
+If you are running an `http.lua`/`proxy.lua` pair that **chunks** large
+messages, set `MAX_REQUEST_BYTES = nil` and only `NUM_CTX` will limit you.
 
 ---
 
@@ -130,6 +186,7 @@ to scroll, and tap any footer button. Pasting into the terminal works too.
 | `/models` | List models installed on the Ollama host |
 | `/host <url>` | Point at a different Ollama instance |
 | `/tools` | List the tools the model can call |
+| `/diag` | Probe the connection and report exactly what came back |
 | `/unsafe` | Toggle skipping permission prompts |
 | `/save <path>` | Write the conversation to a file |
 | `/help` | Command list |

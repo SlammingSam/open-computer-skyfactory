@@ -386,16 +386,17 @@ local function emptyBodyError(status)
   local hostOnly = OLLAMA_HOST:match("^https?://([^/]+)") or OLLAMA_HOST
   return "empty reply from " .. OLLAMA_HOST .. " (reported as HTTP " ..
     tostring(status or "?") .. ").\n" ..
-    "The proxy answered with no body at all, which almost always means the " ..
-    "request never reached Ollama rather than that Ollama replied strangely.\n" ..
-    "Check in this order:\n" ..
-    "1. The proxy computer's screen. It logs every URL and either a status or " ..
-    "an ERROR line. That single line tells you which half of the chain broke.\n" ..
-    "2. On the machine hosting the Minecraft server, run:  curl " ..
+    "1. Most likely: the proxy computer is running an old proxy.lua. " ..
+    "internet.request() is asynchronous, and a proxy that reads the handle " ..
+    "without waiting on finishConnect() gets nothing and reports a guessed " ..
+    "200 OK. Local addresses lose that race every time. Update proxy.lua from " ..
+    "this repo and restart it.\n" ..
+    "2. Check the proxy's screen. The updated one logs the body size, so an " ..
+    "empty body is visible there: '-> 200 OK, 0 bytes'.\n" ..
+    "3. On the machine hosting the Minecraft server, run:  curl " ..
     OLLAMA_HOST .. "/api/tags\n" ..
-    "3. opencomputers.cfg, internet section: enableHttp must be true, and the " ..
-    "blacklist must not cover " .. hostOnly .. ". OpenComputers ships blocking " ..
-    "loopback and private addresses, which is exactly what a local Ollama is."
+    "4. opencomputers.cfg, internet section: enableHttp must be true and the " ..
+    "blacklist must not cover " .. hostOnly .. "."
 end
 
 local function decodeBody(respBody, status)
