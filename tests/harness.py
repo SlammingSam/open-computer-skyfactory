@@ -35,6 +35,9 @@ return {
   listModels = listModels,
   setUnsafe = function(v) UNSAFE = v end,
   MAX_REQUEST_BYTES = MAX_REQUEST_BYTES,
+  HISTORY_CHAR_BUDGET = HISTORY_CHAR_BUDGET,
+  taskIndex = taskIndex,
+  setMaxSteps = function(n) MAX_TOOL_ITERATIONS = n end,
   ui = ui,
   addEntry = addEntry,
   scrollBy = scrollBy,
@@ -425,6 +428,94 @@ check("delete clears the whole line", uistate["input"] == "", uistate["input"])
 handleKey(None, KEY_UP)
 check("arrow keys do not type into the line", uistate["input"] == "", uistate["input"])
 uistate["scroll"] = 0
+
+print("== trimming protects the task being worked on ==")
+# The bug this pins down: trimming dropped from index 2, which on a multi-step
+# job is the user's actual request. The model then had every tool result but no
+# idea what it was for, and stopped partway through.
+TASK = "THE TASK: count every lua file under /home and report the total"
+h = newHistory()
+lua.globals()["__push"](h, "user", TASK)
+lua.execute("""
+function __steps(h, n)
+  for i = 1, n do
+    h[#h+1] = { role = "assistant", content = "", tool_calls = {} }
+    h[#h+1] = { role = "tool", tool_name = "read_file",
+                content = "step " .. i .. " " .. string.rep("z", 1500) }
+  end
+end
+""")
+lua.globals()["__steps"](h, 12)
+before = len(h)
+dropped = mod["trimHistory"](h)
+
+contents = [h[i]["content"] for i in range(1, len(h) + 1)]
+check("trimming actually happened", dropped > 0, dropped)
+check("the task message is still there", TASK in contents, contents[:3])
+check("the system prompt is still there", h[1]["role"] == "system", h[1]["role"])
+check("something was given up", len(h) < before, (before, len(h)))
+check("the most recent step survives",
+      any("step 12" in str(c) for c in contents), contents[-1][:40])
+check("taskIndex finds the request", mod["taskIndex"](h) is not None)
+check("no tool message is left stranded at the front",
+      h[2]["role"] != "tool", h[2]["role"])
+
+# A task with no earlier turns at all must still keep its own request.
+h2 = newHistory()
+lua.globals()["__push"](h2, "user", TASK)
+lua.globals()["__steps"](h2, 30)
+mod["trimHistory"](h2)
+contents2 = [h2[i]["content"] for i in range(1, len(h2) + 1)]
+check("even a very long job keeps the request", TASK in contents2)
+check("and stays inside the budget",
+      mod["historySize"](h2) <= mod["HISTORY_CHAR_BUDGET"],
+      (mod["historySize"](h2), mod["HISTORY_CHAR_BUDGET"]))
+
+print("== running out of steps still answers ==")
+mod["setMaxSteps"](2)
+mod["setReplies"](lua.eval(r"""{
+  '{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"list_files","arguments":{"path":"/home"}}}]},"done":true}',
+  '{"message":{"role":"assistant","content":"I listed /home and found 3 files."},"done":true}'
+}"""))
+h3 = newHistory()
+lua.globals()["__push"](h3, "user", "what is in /home")
+reply = mod["runTurn"](h3, lua.eval("{ onStatus = function() end, confirm = function() return true end }"))
+check("the last pass produces a real answer, not an error",
+      reply == "I listed /home and found 3 files.", reply)
+check("the final pass is sent WITHOUT tools, so it must answer in words",
+      '"tools"' not in mod["lastRequest"]()["payload"],
+      mod["lastRequest"]()["payload"][:120])
+mod["setMaxSteps"](10)
+
+print("== a reply cut off at the token limit says so ==")
+mod["setReplies"](lua.eval(r"""{
+  '{"message":{"role":"assistant","content":""},"done":true,"done_reason":"length"}'
+}"""))
+h4 = newHistory()
+lua.globals()["__push"](h4, "user", "write something enormous")
+res = mod["runTurn"](h4, None)
+err = res[1] if isinstance(res, tuple) else None
+check("truncation is named, not reported as an empty reply",
+      err is not None and "token limit" in err, err)
+check("and it points at the setting to change",
+      err is not None and "OLLAMA_NUM_PREDICT" in err, err)
+
+print("== chunked transport lifts the request ceiling ==")
+# With a chunking http.lua the 8192-byte modem cap no longer applies to a whole
+# request, so the context window becomes the only limit. Leaving the old cap in
+# place squeezed the history budget to ~5,000 characters, which is what made
+# multi-step jobs forget their task in the first place.
+lua_c = LuaRuntime(unpack_returned_tuples=False)
+lua_c.globals()["__libdir"] = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib").replace("\\", "/")
+lua_c.execute(PRELUDE.replace("local fakeHttp = {", "local fakeHttp = {\n  chunked = true,", 1))
+mod_c = lua_c.execute(body)
+check("a chunking transport removes the byte ceiling",
+      mod_c["MAX_REQUEST_BYTES"] is None, mod_c["MAX_REQUEST_BYTES"])
+check("the history budget then follows the context window",
+      mod_c["HISTORY_CHAR_BUDGET"] > 15000, mod_c["HISTORY_CHAR_BUDGET"])
+check("an un-chunked transport keeps the old ceiling",
+      mod["MAX_REQUEST_BYTES"] == 7600, mod["MAX_REQUEST_BYTES"])
 
 print("== file tools against a real filesystem ==")
 import os, tempfile

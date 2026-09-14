@@ -61,13 +61,15 @@ local KEEP_ALIVE = "30m"
 -- run forever on the slow in-game network.
 local MAX_TOOL_ITERATIONS = 10
 
--- Hard ceiling on one outgoing request, in bytes. OpenComputers' modem drops
--- any message over 8192 bytes, and the reference http.lua / proxy.lua pair
--- sends each request as a single modem message, so the whole serialized
--- request has to fit. This is the real constraint on conversation length here
--- — it bites long before NUM_CTX does. Requests are trimmed to fit
--- automatically. Set to nil if your http.lua and proxy.lua chunk large
--- messages, in which case only NUM_CTX matters.
+-- Hard ceiling on one outgoing request, in bytes, or nil for no transport
+-- limit. This only applies to an http.lua/proxy.lua pair that sends each
+-- request as a SINGLE modem message, where OpenComputers' 8192-byte cap
+-- applies to the whole payload. A chunking pair splits the request instead, so
+-- the ceiling is lifted at startup when http.chunked is set.
+--
+-- Leaving this at a small value with a chunking transport is actively harmful:
+-- it squeezes HISTORY_CHAR_BUDGET below what a multi-step task needs, and the
+-- model starts forgetting what it was asked.
 local MAX_REQUEST_BYTES = 7600
 
 -- Tool output longer than this is truncated before being sent back to the
@@ -170,6 +172,7 @@ if env then
   NUM_CTX     = env.number("OLLAMA_NUM_CTX", NUM_CTX)
   NUM_PREDICT = env.number("OLLAMA_NUM_PREDICT", NUM_PREDICT)
   TEMPERATURE = env.number("OLLAMA_TEMPERATURE", TEMPERATURE)
+  MAX_TOOL_ITERATIONS = env.number("OLLAMA_MAX_STEPS", MAX_TOOL_ITERATIONS)
 
   -- Derived from NUM_CTX, so it has to be recomputed after any override.
   HISTORY_CHAR_BUDGET = NUM_CTX * 3 - 4000
@@ -182,6 +185,20 @@ end
 -- especially on the first (cold) request while the model loads into VRAM.
 if type(http.setTimeout) == "function" then
   pcall(http.setTimeout, env and env.number("HTTP_TIMEOUT", 180) or 180)
+end
+
+-- A chunking transport splits a large request across modem messages, so the
+-- 8192-byte cap no longer applies to the payload as a whole and the context
+-- window becomes the only real limit. Without this the history budget collapses
+-- to about 5,000 characters, which is roughly three tool results — not enough
+-- to hold the task and the work, so multi-step jobs stall partway.
+if http.chunked then
+  MAX_REQUEST_BYTES = nil
+end
+
+HISTORY_CHAR_BUDGET = NUM_CTX * 3 - 4000
+if MAX_REQUEST_BYTES then
+  HISTORY_CHAR_BUDGET = math.min(HISTORY_CHAR_BUDGET, MAX_REQUEST_BYTES - 2400)
 end
 
 -- ============================== Ollama client ===============================
@@ -362,6 +379,9 @@ local function ollamaChat(messages, tools)
     promptTokens = tonumber(data.prompt_eval_count) or 0,
     replyTokens  = tonumber(data.eval_count) or 0,
     seconds      = (tonumber(data.total_duration) or 0) / 1e9,
+    -- "length" means the reply was cut off at num_predict rather than the
+    -- model choosing to stop, which is what a half-finished answer looks like.
+    doneReason   = data.done_reason,
   }
   return data.message
 end
@@ -775,13 +795,61 @@ local function historySize(history)
   return n
 end
 
+-- Where the job currently being worked on was stated. Everything after it is
+-- the work itself, so on a multi-step task this is the single most important
+-- message in the history — dropping it is what makes a model forget what it
+-- was asked and stop halfway through.
+local function taskIndex(history)
+  for i = #history, 2, -1 do
+    if history[i].role == "user" then return i end
+  end
+  return nil
+end
+
+-- Keeps the conversation inside the budget, in order of preference:
+--   1. whole earlier turns, from the front
+--   2. the oldest completed step of the current task
+--   3. nothing else — the system prompt and the task itself are never dropped
+-- Returns how many messages went, so the UI can say so rather than leaving the
+-- model to quietly lose the plot.
 local function trimHistory(history)
-  while #history > 3 and historySize(history) > HISTORY_CHAR_BUDGET do
+  local dropped = 0
+
+  -- Earlier turns first. These are finished conversations; losing them costs
+  -- context but not the current job.
+  while historySize(history) > HISTORY_CHAR_BUDGET do
+    local task = taskIndex(history)
+    if not task or task <= 2 then break end
     table.remove(history, 2)
-    while #history > 3 and history[2].role == "tool" do
+    dropped = dropped + 1
+    -- Never leave a tool result without the assistant turn that requested it;
+    -- Ollama rejects that outright.
+    while history[2] and history[2].role == "tool" and (taskIndex(history) or 0) > 2 do
       table.remove(history, 2)
+      dropped = dropped + 1
     end
   end
+
+  -- Still over: give up the oldest completed step of the current task, taking
+  -- the assistant turn and its results together so nothing is orphaned. The
+  -- two most recent messages stay, so the model always sees what just happened.
+  while historySize(history) > HISTORY_CHAR_BUDGET do
+    local task = taskIndex(history) or 1
+    local victim = nil
+    for i = task + 1, #history - 2 do
+      if history[i].role == "assistant" then victim = i; break end
+    end
+    if not victim then break end
+
+    table.remove(history, victim)
+    dropped = dropped + 1
+    while history[victim] and history[victim].role == "tool" do
+      table.remove(history, victim)
+      dropped = dropped + 1
+    end
+  end
+
+  return dropped
 end
 
 -- runTurn(history, cb) -> replyText, err
@@ -793,11 +861,27 @@ local function runTurn(history, cb)
   local function status(s) if cb.onStatus then cb.onStatus(s) end end
 
   for iteration = 1, MAX_TOOL_ITERATIONS do
-    trimHistory(history)
-    status(iteration == 1 and "thinking…"
-                          or ("thinking… (step " .. iteration .. " of " .. MAX_TOOL_ITERATIONS .. ")"))
+    local dropped = trimHistory(history)
+    if dropped > 0 and cb.onNote then
+      cb.onNote(string.format(
+        "context is full — dropped %d older message%s. The task itself is kept, " ..
+        "but earlier steps are gone. Raise OLLAMA_NUM_CTX in /home/.env for " ..
+        "longer jobs.", dropped, dropped == 1 and "" or "s"))
+    end
 
-    local msg, err = ollamaChat(history, TOOLS)
+    -- On the final pass, ask without tools. The model then has to answer in
+    -- words, so running out of steps produces a real reply about what it
+    -- managed rather than an error and nothing to show for the work.
+    local lastPass = (iteration == MAX_TOOL_ITERATIONS)
+
+    if lastPass then
+      status("out of steps — asking for a final answer")
+    else
+      status(iteration == 1 and "thinking…"
+                            or ("thinking… (step " .. iteration .. " of " .. MAX_TOOL_ITERATIONS .. ")"))
+    end
+
+    local msg, err = ollamaChat(history, (not lastPass) and TOOLS or nil)
     if not msg then return nil, err end
 
     local calls = msg.tool_calls
@@ -812,6 +896,13 @@ local function runTurn(history, cb)
     if not hasCalls then
       local text = msg.content
       if type(text) ~= "string" or not text:match("%S") then
+        -- A reply cut off at the token limit is the usual cause of a blank
+        -- one: the model was mid-sentence, or mid-tool-call, when it ran out.
+        if lastStats and lastStats.doneReason == "length" then
+          return nil, "the reply hit the " .. NUM_PREDICT .. "-token limit before " ..
+                      "the model said anything usable. Raise OLLAMA_NUM_PREDICT " ..
+                      "in /home/.env, or ask for something smaller."
+        end
         return nil, "the model returned an empty reply — try rephrasing, or /new to reset"
       end
       return text
@@ -853,8 +944,11 @@ local function runTurn(history, cb)
     end
   end
 
+  -- Only reachable if the final no-tools pass still came back with tool calls,
+  -- which a well-behaved model will not do.
   return nil, "gave up after " .. MAX_TOOL_ITERATIONS ..
-              " tool steps without a final answer"
+              " tool steps without a final answer. Ask for one step at a time, " ..
+              "or raise OLLAMA_MAX_STEPS in /home/.env."
 end
 
 local function newHistory()
@@ -1066,15 +1160,21 @@ local function drawHeader()
   if lastStats then
     right = string.format("%d+%d tok", lastStats.promptTokens, lastStats.replyTokens)
   end
+  -- The badge is always here, always tappable, and always says which mode is
+  -- on. Showing it only while unsafe meant it could be switched off by touch
+  -- but never on, and left "safe" looking identical to "no badge drawn yet".
+  local badge = UNSAFE and " UNSAFE " or " SAFE "
+  local badgeX = math.max(2, W - ulen(badge))
+
   if right ~= "" then
     fg(C.headerFg)
-    gset(math.max(10, W - ulen(right) - (UNSAFE and 10 or 1)), 1, right)
+    gset(math.max(10, badgeX - ulen(right) - 2), 1, right)
   end
-  if UNSAFE then
-    bg(C.bad); fg(0xFFFFFF)
-    gset(W - 8, 1, " UNSAFE ")
-    addHit(W - 8, 1, 8, 1, "cmd", "/unsafe")
-  end
+
+  bg(UNSAFE and C.bad or C.good)
+  fg(0x000000)
+  gset(badgeX, 1, badge)
+  addHit(badgeX, 1, ulen(badge), 1, "cmd", "/unsafe")
   bg(C.bg)
 end
 
@@ -1143,13 +1243,13 @@ local function drawHintBar(entries)
   bg(C.bg); gfill(1, H, W, 1, " ")
   local x = 2
   for _, e in ipairs(entries) do
-    local key, desc, action, value = e[1], e[2], e[3], e[4]
+    local key, desc, action, value, colour = e[1], e[2], e[3], e[4], e[5]
     local chip = " " .. key .. " "
     local width = ulen(chip) + ((desc ~= "") and (1 + ulen(desc)) or 0)
     if x + width > W then break end
 
     bg(action and C.selBg or C.bg)
-    fg(C.accent); gset(x, H, chip)
+    fg(colour or C.accent); gset(x, H, chip)
     bg(C.bg)
     if desc ~= "" then
       fg(C.label); gset(x + ulen(chip) + 1, H, desc)
@@ -1168,13 +1268,17 @@ local function render()
   drawInput()
   drawStatus()
   drawHintBar({
-    { "Send",  "",       "key",  "enter" },
-    { "▲",     "",       "scroll", 3 },
-    { "▼",     "",       "scroll", -3 },
-    { "Clear", "line",   "key",  "clear" },
-    { "/new",  "",       "cmd",  "/new" },
-    { "/help", "",       "cmd",  "/help" },
-    { "Exit",  "",       "cmd",  "/exit" },
+    { "Send",  "",     "key",    "enter" },
+    { "▲",     "",     "scroll", 3 },
+    { "▼",     "",     "scroll", -3 },
+    { "Clear", "line", "key",    "clear" },
+    -- Reads as what tapping it will DO, not as the current state, so it
+    -- cannot be misread the way a bare status label can.
+    { UNSAFE and "Go safe" or "Go unsafe", "", "cmd", "/unsafe",
+      UNSAFE and C.good or C.bad },
+    { "/new",  "",     "cmd",    "/new" },
+    { "/help", "",     "cmd",    "/help" },
+    { "Exit",  "",     "cmd",    "/exit" },
   })
 end
 
@@ -1243,6 +1347,14 @@ local callbacks = {
 
   onAssistantNote = function(text)
     addEntry("ai", text)
+    render()
+  end,
+
+  -- Things the user needs to know about the run itself, like the context
+  -- filling up. Silent trimming is what makes a long job appear to lose its
+  -- way for no reason.
+  onNote = function(text)
+    addEntry("info", text)
     render()
   end,
 
@@ -1575,6 +1687,7 @@ local function runOneShot(question)
 
   local reply, err = runTurn(hist, {
     onStatus = function(s) print("[ollama] " .. s) end,
+    onNote = function(s) print("[ollama] " .. s) end,
     onToolCall = function(name, args)
       print("[tool] " .. name .. " " .. json.encode(args))
     end,

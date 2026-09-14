@@ -195,6 +195,28 @@ Results are also written to `/home/nettest.txt`.
 length and first bytes of what actually came back, instead of trying to
 interpret it.
 
+### A multi-step job stops halfway
+
+The conversation budget comes from `OLLAMA_NUM_CTX`. When it fills, the oldest
+*completed steps* are dropped — never the system prompt, and never the request
+you made, so the model cannot forget what it was asked. The chat says so when
+it happens rather than letting the model quietly lose the plot.
+
+If it still stalls:
+
+- **Raise `OLLAMA_NUM_CTX`** in `/home/.env`. This is the one that matters. At
+  8192 with a 7B model there is VRAM headroom on an 8 GB card to go higher.
+- **Raise `OLLAMA_NUM_PREDICT`** if replies end mid-sentence. A reply cut off
+  at the token limit is reported as such rather than as an empty reply.
+- **Raise `OLLAMA_MAX_STEPS`** if it runs out of tool calls. The final step is
+  always asked *without* tools, so running out produces a real answer about
+  what got done instead of an error.
+
+Note that `bin/proxy.lua` and `lib/http.lua` must both be the chunking
+versions. With an older pair the request ceiling stays at 8192 bytes, which
+squeezes the conversation to about three tool results and makes long jobs
+stall no matter what the context window says.
+
 ### Long conversations failing
 
 An OpenComputers modem drops any message over **8192 bytes**, and the reference
@@ -271,8 +293,13 @@ defined" is the single most useful thing a coding assistant does.
 
 ### Unsafe mode
 
-`-u` on the command line, or `/unsafe` in the chat, skips every confirmation.
-The header turns red and says `UNSAFE` while it is on.
+Three ways to toggle it: the **Go unsafe / Go safe** button in the footer, the
+**SAFE / UNSAFE** badge in the top-right corner, or `/unsafe`. `-u` on the
+command line starts in unsafe mode.
+
+The badge is always visible and always says which mode you are in — green
+`SAFE` or red `UNSAFE` — so there is no state where the absence of a warning
+means "probably safe".
 
 This lets the model write files and run shell commands on this computer with
 no review. That is the point of it, and also the risk — a 7B model that

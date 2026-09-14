@@ -78,6 +78,11 @@ network.open(PORT)
 
 local http = {}
 
+-- Lets a caller tell this version apart from the pre-chunking one, so it can
+-- size its requests accordingly instead of assuming the 8192-byte modem limit
+-- applies to the whole payload. Requires a matching proxy.lua.
+http.chunked = true
+
 -- Local model inference regularly runs past a short timeout, so callers need
 -- to be able to raise it without editing this file.
 function http.setTimeout(seconds)
