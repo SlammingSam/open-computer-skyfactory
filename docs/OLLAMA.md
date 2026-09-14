@@ -37,16 +37,15 @@ ollama pull qwen2.5:7b-instruct
 - Pascal cards have no fast FP16 path, so a 4-bit quant is the right call
   anyway. Expect roughly 25–40 tokens/sec.
 
-**If you mostly ask it to write code, use `qwen2.5-coder:7b` instead.** Same
-size, same VRAM, substantially better at Lua and at fixing its own mistakes.
-Testing the instruct model on a write-a-program task, it hit a nil global,
-and rather than adding the missing `require` line it replaced the real library
-with a stub returning a hardcoded `192.0.2.1` — then reported that as the
-computer's proxy address. The coder variant is far less prone to that.
+**The model must support tool calling.** This is not optional and not a
+preference: a model without it writes out the calls it wants as text and
+nothing runs, while the reply looks like work in progress. `/models` marks
+which of your installed models can, and the client refuses to start quietly on
+one that cannot.
 
-```bash
-ollama pull qwen2.5-coder:7b
-```
+`qwen2.5-coder:7b` is tempting for a coding assistant and **does not work here**
+— it has no tool support in Ollama. Its generated code was correct; it simply
+had no way to execute any of it.
 
 **Alternatives**, switchable at runtime with `/model <name>`:
 
@@ -205,6 +204,17 @@ Results are also written to `/home/nettest.txt`.
 `/diag` inside the app probes the connection and reports the status, body
 length and first bytes of what actually came back, instead of trying to
 interpret it.
+
+### It describes tool calls instead of making them
+
+The reply is a list of JSON objects like
+`{"name": "read_file", "arguments": {...}}` and no tools ever run. That model
+has no tool support in Ollama's template for it. The client now says so up
+front, at startup and again if it happens mid-conversation.
+
+`/models` marks each installed model `(tools)` or `(NO tools — unusable here)`.
+Pick one from the first group. Nothing about the prompt or the client can work
+around this.
 
 ### It fabricates a library, or hardcodes an answer
 

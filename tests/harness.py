@@ -522,6 +522,38 @@ check("the final pass is sent WITHOUT tools, so it must answer in words",
       mod["lastRequest"]()["payload"][:120])
 mod["setMaxSteps"](10)
 
+print("== a model that cannot call tools is caught ==")
+# qwen2.5-coder:7b has no tool support in Ollama. Asked to do a job, it wrote
+# the calls out as text: correct-looking content, nothing executed. Silence
+# would read as success, since the reply looks exactly like work in progress.
+# Built with json.dumps rather than hand-escaped: the content is itself JSON,
+# and nesting quotes by hand produced a fixture that was not valid JSON at all.
+import json as pyjson
+_as_text = pyjson.dumps({
+    "message": {"role": "assistant",
+                "content": '{"name": "read_file", "arguments": {"path": "/home/lib/http.lua"}}'},
+    "done": True})
+mod["setReplies"](lua.table_from([_as_text]))
+h7 = newHistory()
+lua.globals()["__push"](h7, "user", "read http.lua")
+res = mod["runTurn"](h7, None)
+err = res[1] if isinstance(res, tuple) else None
+check("tool calls written as text are reported, not shown as an answer",
+      err is not None and "wrote its tool calls out as text" in err, err)
+check("and it says nothing ran", err is not None and "nothing actually ran" in err, err)
+check("and points at how to pick a working model",
+      err is not None and "/models" in err, err)
+
+# Ordinary prose that happens to mention those words must not trip it.
+mod["setReplies"](lua.eval(r"""{
+  '{"message":{"role":"assistant","content":"The name field and the arguments are both required."},"done":true}'
+}"""))
+h8 = newHistory()
+lua.globals()["__push"](h8, "user", "explain the schema")
+reply = mod["runTurn"](h8, None)
+check("prose mentioning name and arguments is left alone",
+      reply == "The name field and the arguments are both required.", reply)
+
 print("== an empty turn is resampled, not surfaced ==")
 # Observed in use: asked a question answerable straight from the system prompt,
 # the model returned a completely empty turn and the user got an error. Small

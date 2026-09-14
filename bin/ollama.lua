@@ -337,15 +337,36 @@ end
 
 -- Lists installed models. Doubles as the startup reachability check, since it
 -- is the cheapest endpoint that proves the whole chain works.
+-- Which models can actually call tools. Ollama reports this per model in
+-- /api/tags, and it matters more than anything else here: a model without it
+-- writes the calls out as text and nothing runs, which looks like progress.
+local modelCaps = {}
+
 local function listModels()
   local data, err = getJson("/api/tags")
   if not data then return nil, err end
   local names = {}
+  modelCaps = {}
   for _, m in ipairs(data.models or {}) do
-    if type(m) == "table" and m.name then names[#names + 1] = m.name end
+    if type(m) == "table" and m.name then
+      names[#names + 1] = m.name
+      if type(m.capabilities) == "table" then
+        local set = {}
+        for _, c in ipairs(m.capabilities) do set[tostring(c)] = true end
+        modelCaps[m.name] = set
+      end
+    end
   end
   table.sort(names)
   return names
+end
+
+-- true / false, or nil when the server did not say (older Ollama builds do
+-- not report capabilities, and guessing would be worse than staying quiet).
+local function modelSupportsTools(name)
+  local caps = modelCaps[name] or modelCaps[name .. ":latest"]
+  if not caps then return nil end
+  return caps.tools == true
 end
 
 -- Drops the oldest droppable message, keeping the system prompt at index 1 and
@@ -1007,6 +1028,16 @@ local function runTurn(history, cb)
     if not hasCalls then
       local text = msg.content
       if type(text) == "string" and text:match("%S") then
+        -- A model whose Ollama template lacks tool support writes the calls
+        -- out as text instead of making them. The reply looks like work in
+        -- progress, but nothing ran and nothing will. Catch it here too, for
+        -- servers too old to report capabilities up front.
+        if text:find('{%s*"name"%s*:') and text:find('"arguments"%s*:') then
+          return nil, MODEL .. " wrote its tool calls out as text instead of " ..
+                      "making them, so nothing actually ran. That model cannot " ..
+                      "call tools in Ollama. Use /models and pick one marked " ..
+                      "(tools)."
+        end
         return text
       end
 
@@ -1717,6 +1748,25 @@ local function checkConnection(quiet)
     return false
   end
 
+  -- A model without tool support is the most misleading failure available
+  -- here: it writes the calls out as text, which reads like it is working
+  -- while nothing at all happens. Say so before a single question is asked.
+  if modelSupportsTools(MODEL) == false then
+    local capable = {}
+    for _, n in ipairs(models) do
+      if modelSupportsTools(n) then capable[#capable + 1] = n end
+    end
+    addEntry("error", MODEL .. " cannot call tools.\n" ..
+      "Ollama lists its capabilities without \"tools\", which means it will " ..
+      "write out the calls it wants as text and nothing will actually run. " ..
+      "The reply will look like work.\n" ..
+      (#capable > 0
+        and ("Installed models that can: " .. table.concat(capable, ", "))
+        or "None of the installed models report tool support."))
+    setStatus("this model cannot use tools - switch with /model", "bad")
+    return false
+  end
+
   if not quiet then
     setStatus("loading " .. MODEL .. " into VRAM ...", "info")
     render()
@@ -1802,9 +1852,20 @@ local function runCommand(line)
       addEntry("error", tostring(err))
       setStatus("could not list models", "bad")
     else
-      addEntry("info", "Installed on " .. OLLAMA_HOST .. ":\n  " ..
-                       table.concat(models, "\n  "))
-      setStatus(#models .. " models installed", "good")
+      -- Tool support is the only capability that matters for this client, so
+      -- it is marked rather than left to be discovered by a wasted question.
+      local rows, capable = {}, 0
+      for _, n in ipairs(models) do
+        local t = modelSupportsTools(n)
+        local mark = ""
+        if t == true then mark = "  (tools)"; capable = capable + 1
+        elseif t == false then mark = "  (NO tools — unusable here)" end
+        rows[#rows + 1] = "  " .. n .. mark
+      end
+      addEntry("info", "Installed on " .. OLLAMA_HOST .. ":\n" ..
+                       table.concat(rows, "\n"))
+      setStatus(string.format("%d models installed, %d can call tools",
+                              #models, capable), "good")
     end
 
   elseif cmd == "/host" then
