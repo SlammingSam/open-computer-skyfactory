@@ -89,12 +89,39 @@ local TIMEOUT = 180
 caps replies at 600 tokens — but a long tool-heavy answer can still hit 30 s.
 If you see `request timed out after 30s`, this is why, and the app will say so.
 
-### 4. If OpenComputers refuses to connect
+### 4. Un-blacklist loopback (required — do this one)
 
-OpenComputers ships blocking **loopback and private addresses** — which is
-exactly what a local Ollama is. In `opencomputers.cfg`, under `internet`, make
-sure `enableHttp=true` and that your Ollama address is not caught by
-`blacklist`. This is the most likely reason a local instance is unreachable.
+**OpenComputers blocks loopback and private addresses by default**, which is
+exactly what a local Ollama is. Until this is changed, nothing else in this
+document will help: the card refuses the connection and reports nothing useful
+back, so it looks like an empty successful response rather than a refusal.
+
+Stop the Minecraft server, open `config/opencomputers.cfg`, find the
+`internet {` block, and delete the loopback entries from `blacklist`:
+
+```
+internet {
+    blacklist=[
+        "127.0.0.0/8",     <-- delete
+        "localhost",       <-- delete if present
+        "10.0.0.0/8",
+        "192.168.0.0/16",
+        ...
+    ]
+}
+```
+
+Leave the rest of the list alone, and make sure `enableHttp=true` in the same
+block. Restart the server.
+
+Removing the loopback entries lets any in-game computer reach services
+listening on the server host itself. That is the point — it is where Ollama is
+— but it is a real widening of what the mod can talk to, so do not clear the
+whole list when two lines will do.
+
+There is no way around this from inside the game. Raw TCP to the same address
+is blocked identically (`nettest.lua` confirms it with `connection lost`), so
+the config is the only lever.
 
 ---
 
@@ -102,8 +129,22 @@ sure `enableHttp=true` and that your Ollama address is not caught by
 
 ### "Could not reach Ollama — empty reply"
 
-**Update `proxy.lua` on the proxy computer and restart it.** This repo's
-version fixes the cause.
+**First: un-blacklist loopback (step 4 above).** This is the usual cause and
+it is invisible from the client. The Internet Card refuses the address, but
+does not surface the refusal — `read()` returns nothing and `response()`
+reports no status, so `proxy.lua` falls back to a hardcoded `200 OK`. A
+blocked request and a successful empty one look identical.
+
+Run `nettest.lua` on the proxy computer to see the real reason:
+
+```
+finishConnect -> nil, address is blacklisted
+```
+
+The rest of this section covers causes that are already fixed in this repo,
+kept because the symptoms are easy to confuse.
+
+**Make sure `proxy.lua` on the proxy computer is this repo's version.**
 
 `internet.request()` in OpenComputers is **asynchronous** — it hands back a
 handle before the connection exists. The original `proxy.lua` read from that

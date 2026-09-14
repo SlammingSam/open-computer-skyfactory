@@ -386,17 +386,17 @@ local function emptyBodyError(status)
   local hostOnly = OLLAMA_HOST:match("^https?://([^/]+)") or OLLAMA_HOST
   return "empty reply from " .. OLLAMA_HOST .. " (reported as HTTP " ..
     tostring(status or "?") .. ").\n" ..
-    "1. Most likely: the proxy computer is running an old proxy.lua. " ..
-    "internet.request() is asynchronous, and a proxy that reads the handle " ..
-    "without waiting on finishConnect() gets nothing and reports a guessed " ..
-    "200 OK. Local addresses lose that race every time. Update proxy.lua from " ..
-    "this repo and restart it.\n" ..
-    "2. Check the proxy's screen. The updated one logs the body size, so an " ..
-    "empty body is visible there: '-> 200 OK, 0 bytes'.\n" ..
-    "3. On the machine hosting the Minecraft server, run:  curl " ..
-    OLLAMA_HOST .. "/api/tags\n" ..
-    "4. opencomputers.cfg, internet section: enableHttp must be true and the " ..
-    "blacklist must not cover " .. hostOnly .. "."
+    "1. Almost always: OpenComputers is blocking " .. hostOnly .. ". It ships " ..
+    "with loopback and private addresses blacklisted, and the card does not " ..
+    "surface the refusal -- no body and no status, which proxy.lua then " ..
+    "reports as a guessed 200 OK. Stop the server, edit config/" ..
+    "opencomputers.cfg, and delete the loopback entries (127.0.0.0/8, " ..
+    "localhost) from blacklist in the internet block.\n" ..
+    "2. Confirm it by running nettest.lua on the proxy computer. A blocked " ..
+    "address prints: finishConnect -> nil, address is blacklisted\n" ..
+    "3. On the machine hosting the Minecraft server, check Ollama itself:  " ..
+    "curl " .. OLLAMA_HOST .. "/api/tags\n" ..
+    "4. Make sure proxy.lua on the proxy computer is this repo's version."
 end
 
 local function decodeBody(respBody, status)
