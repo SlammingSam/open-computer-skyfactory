@@ -93,6 +93,57 @@ local function mergeDefaults(loaded, defaults)
   return loaded
 end
 
+-- Settings come off disk, where a hand-edited or half-written file can hold
+-- anything. Most consumers already guard with tonumber(...) or a default, but a
+-- rule that is not a table at all, a direction that is neither below nor above,
+-- or a rules list that is not a list would still crash the evaluation loop on
+-- the next tick. Drop what cannot be used and keep running, rather than
+-- refusing to start or dying mid-pass.
+local function sanitiseSettings(s)
+  if type(s) ~= "table" then return defaultSettings() end
+  local fresh = defaultSettings()
+  if type(s.autoCraft) ~= "table" then s.autoCraft = fresh.autoCraft end
+  local ac = s.autoCraft
+
+  ac.enabled = (ac.enabled == true)
+
+  local floors = { maxBatch = 1, reserveCpus = 0, checkSeconds = 1 }
+  for field, floor in pairs(floors) do
+    local n = tonumber(ac[field])
+    if not n or n < floor then
+      ac[field] = fresh.autoCraft[field]
+    else
+      ac[field] = math.floor(n)
+    end
+  end
+
+  if type(ac.rules) ~= "table" then ac.rules = {} end
+  local clean = {}
+  for _, rule in ipairs(ac.rules) do
+    local usable = type(rule) == "table"
+      and type(rule.key) == "string" and rule.key ~= ""
+      and (rule.direction == "below" or rule.direction == "above")
+      and tonumber(rule.threshold) ~= nil
+    if usable then
+      rule.label     = tostring(rule.label or rule.key)
+      rule.enabled   = (rule.enabled ~= false)
+      rule.threshold = math.floor(tonumber(rule.threshold))
+      if rule.direction == "below" then
+        rule.craftQty = math.max(1, math.floor(tonumber(rule.craftQty) or 1))
+      else
+        rule.keep  = math.max(0, math.floor(tonumber(rule.keep) or 0))
+        rule.ratio = math.max(1, math.floor(tonumber(rule.ratio) or 1))
+      end
+      -- nil means "no cap of its own", which is how a per-rule cap is cleared.
+      local cap = math.floor(tonumber(rule.maxBatch) or 0)
+      rule.maxBatch = (cap >= 1) and cap or nil
+      clean[#clean + 1] = rule
+    end
+  end
+  ac.rules = clean
+  return s
+end
+
 -- ------------------------------ durable writes ------------------------------
 -- A plain write() + close() is not atomic: losing power partway leaves a
 -- truncated file, unserialize fails, and everything silently reverts to
@@ -159,7 +210,7 @@ local function loadSettings()
   -- Prefer the live file; fall back to the backup if it's missing or corrupt.
   local loaded = readTable(SETTINGS_PATH) or readTable(SETTINGS_PATH .. ".bak")
   if not loaded then return defaultSettings() end
-  return mergeDefaults(loaded, defaultSettings())
+  return sanitiseSettings(mergeDefaults(loaded, defaultSettings()))
 end
 
 local function saveSettings(s)
@@ -562,7 +613,7 @@ local ui = {
   acTop = 1,            -- first visible row of that list
   -- Inline editor for a global auto-craft number: nil, "maxBatch" or
   -- "reserveCpus". One mechanism rather than a flag per setting.
-  acEdit = nil, acEditText = "",
+  acEdit = nil, acEditText = "", acEditRule = nil,
 
   logTop = 1,                            -- first visible log row
   logFilter = "", logFilterMode = false, -- search over the event log
@@ -685,7 +736,7 @@ local function evaluateAutoCraft()
   end
   state.autoCraftCheckedAt = computer.uptime()
 
-  local maxBatch = math.max(1, math.floor(tonumber(ac.maxBatch) or 1000))
+  local globalBatch = math.max(1, math.floor(tonumber(ac.maxBatch) or 1000))
   local budget = freeCpuBudget()      -- shared across all rules this pass
 
   for _, rule in ipairs(ac.rules) do
@@ -739,7 +790,13 @@ local function evaluateAutoCraft()
         -- different CPUs, where the ingredient chains are independent.
         if entry and needed and needed >= 1 and not backingOff
            and quantityInFlight(label) == 0 then
-          local batch = math.min(needed, maxBatch)
+          -- A per-rule cap wins where one is set. A single global number has
+          -- to be tuned for the most expensive recipe in the list, which then
+          -- throttles every cheaper one: quartz at 4:1 and steel at 9:1 want
+          -- very different batch sizes.
+          local cap = math.floor(tonumber(rule.maxBatch) or 0)
+          if cap < 1 then cap = globalBatch end
+          local batch = math.min(needed, cap)
           local ok, result = requestCraft(entry, batch, label, true)
           if ok then
             budget = budget - 1
@@ -1179,12 +1236,15 @@ end
 
 -- One-line description of what a rule actually does when it fires.
 local function ruleAction(rule)
+  -- Shown only when the rule overrides the global cap, so the common case
+  -- stays uncluttered and an override is immediately visible.
+  local cap = rule.maxBatch and ("  max " .. comma(rule.maxBatch)) or ""
   if rule.direction == "below" then
-    return "craft " .. comma(rule.craftQty or 0)
+    return "craft " .. comma(rule.craftQty or 0) .. cap
   end
   return "-> " .. (rule.craftLabel or "?")
     .. "  keep " .. comma(rule.keep or 0)
-    .. "  " .. tostring(rule.ratio or 1) .. ":1"
+    .. "  " .. tostring(rule.ratio or 1) .. ":1" .. cap
 end
 
 local function drawAutoCraftTab()
@@ -1282,7 +1342,11 @@ local function drawAutoCraftTab()
       gset(c.xWhen, y, fit(
         (rule.direction == "below" and "< " or "> ") .. comma(rule.threshold), c.wWhen))
       fg(C.craft)
-      gset(c.xAct, y, fit(ruleAction(rule), c.wAct))
+      local action = ruleAction(rule)
+      if ui.acEdit == "ruleBatch" and ui.acEditRule == idx then
+        action = action .. "   max " .. ui.acEditText .. "_"
+      end
+      gset(c.xAct, y, fit(action, c.wAct))
       fg(rule.enabled and C.good or C.zero)
       gset(c.xState, y, rule.enabled and "on" or "off")
     end
@@ -1537,7 +1601,8 @@ local function drawSettingsFooter()
     {"Enter", "edit",  {code = KEY_ENTER}},
     {"D", "delete",    {char = string.byte("d")}},
     {"E", "on/off",    {char = string.byte("e")}},
-    {"M", "batch",     {char = string.byte("m")}},
+    {"B", "rule batch", {char = string.byte("b")}},
+    {"M", "all batch", {char = string.byte("m")}},
     {"V", "reserve",   {char = string.byte("v")}},
     {"I", "interval",  {char = string.byte("i")}},
     {"O", "back",      {char = string.byte("o")}},
@@ -1946,6 +2011,32 @@ local function handleSettingsKey(char, code)
   -- Inline editor for a global number takes the keyboard while open.
   if ui.acEdit then
     local field = ui.acEdit
+
+    -- A rule's own cap, rather than one of the global numbers. Blank or zero
+    -- clears it, which is the only way back to the global setting.
+    if field == "ruleBatch" then
+      if isCancel(code) then
+        ui.acEdit, ui.acEditText, ui.acEditRule = nil, "", nil
+      elseif code == KEY_ENTER then
+        local rule = rules[ui.acEditRule or 0]
+        if rule then
+          local n = tonumber(ui.acEditText)
+          rule.maxBatch = (n and n >= 1) and math.floor(n) or nil
+          local ok, err = saveSettings(settings)
+          setStatus(
+            ok and (rule.label .. ": batch cap " ..
+                    (rule.maxBatch and comma(rule.maxBatch) or "cleared, using the global one"))
+                or ("changed but NOT saved to disk: " .. tostring(err)),
+            ok and "good" or "bad"
+          )
+        end
+        ui.acEdit, ui.acEditText, ui.acEditRule = nil, "", nil
+      else
+        ui.acEditText = editNumber(ui.acEditText, char, code, 7)
+      end
+      return
+    end
+
     if isCancel(code) then
       ui.acEdit, ui.acEditText = nil, ""
     elseif code == KEY_ENTER then
@@ -1992,6 +2083,12 @@ local function handleSettingsKey(char, code)
         .. (settings.autoCraft.enabled and "enabled" or "disabled"),
       ok and "good" or "bad"
     )
+  elseif ch == "b" then
+    local rule = rules[ui.acSelected]
+    if rule then
+      ui.acEdit, ui.acEditRule = "ruleBatch", ui.acSelected
+      ui.acEditText = rule.maxBatch and tostring(rule.maxBatch) or ""
+    end
   elseif ch == "a" then
     openRuleForm(nil, nil, nil)
   elseif ch == "d" then

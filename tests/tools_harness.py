@@ -391,6 +391,155 @@ check("--list writes no files",
 check("--list does not even save state",
       fileat(lua5, "/home/.update_state") is None)
 
+print("== doctor.lua ==")
+# Every failure this project actually hit is a check in doctor.lua. What the
+# test pins down is that it survives a broken machine and names the fix, since
+# a broken machine is exactly when it gets run.
+DOCTOR = open(os.path.join(ROOT, "bin", "doctor.lua"), encoding="utf-8").read()
+
+DOCTOR_PRELUDE = r"""
+_G.__out = {}
+print = function(...)
+  local parts = {}
+  for i = 1, select("#", ...) do parts[#parts + 1] = tostring((select(i, ...))) end
+  _G.__out[#_G.__out + 1] = table.concat(parts, " ")
+end
+
+io.open = function(path, mode)
+  if (mode or "r"):find("r") then
+    local c = _G.__files[path]
+    if c == nil then return nil end
+    return { read = function() return c end, close = function() end,
+             lines = function()
+               local pos = 1
+               return function()
+                 if pos > #c then return nil end
+                 local nl = c:find("\n", pos, true)
+                 local line
+                 if nl then line = c:sub(pos, nl - 1); pos = nl + 1
+                 else line = c:sub(pos); pos = #c + 1 end
+                 return line
+               end
+             end }
+  end
+  return { write = function() end, close = function() end }
+end
+
+os.getenv = function(k) return _G.__envvars[k] end
+
+_G.__stubs.component = {
+  list = function(ctype)
+    local rows = {}
+    for addr, t in pairs(_G.__hw) do
+      if not ctype or t == ctype then rows[#rows + 1] = { addr, t } end
+    end
+    local i = 0
+    return function() i = i + 1; if rows[i] then return rows[i][1], rows[i][2] end end
+  end,
+  isAvailable = function(t)
+    for _, v in pairs(_G.__hw) do if v == t then return true end end
+    return false
+  end,
+}
+
+local realLoadfile = loadfile
+loadfile = function(path)
+  if type(path) ~= "string" then return nil end
+  local name = path:match("([%w_]+)%.lua$")
+  if name == "http" then return function() return _G.__fakehttp end end
+  if name then return realLoadfile(_G.__libdir .. "/" .. name .. ".lua") end
+  return nil
+end
+"""
+
+
+def run_doctor(hw, fakehttp, files, envvars):
+    lua = new_runtime()
+    lua.globals()["__hw"] = lua.table_from(hw)
+    lua.globals()["__envvars"] = lua.table_from(envvars)
+    for k, v in files.items():
+        lua.globals()["__files"][k] = v
+    lua.execute(DOCTOR_PRELUDE)
+    lua.globals()["__fakehttp"] = lua.eval(fakehttp)
+    lua.execute(DOCTOR)
+    out = lua.globals()["__out"]
+    return chr(10).join(out[i] for i in range(1, len(out) + 1))
+
+
+HEALTHY_HTTP = """{
+  chunked = true,
+  setTimeout = function() end,
+  proxyAddress = function() return "proxy-addr-123" end,
+  get = function(url)
+    return '{"models":[{"name":"qwen2.5:7b-instruct","capabilities":["completion","tools"]}]}'
+  end,
+}"""
+
+text = run_doctor(
+    hw={"a1": "modem", "a2": "gpu", "a3": "screen"},
+    fakehttp=HEALTHY_HTTP,
+    files={"/home/.env": "PROXY_ADDRESS=proxy-addr-123" + chr(10) +
+                         "OLLAMA_MODEL=qwen2.5:7b-instruct" + chr(10),
+           "/home/.update_state": "{}"},
+    envvars={"PATH": "/bin:/usr/bin:/home/bin:."})
+check("a healthy machine reports no problems", "Everything checks out" in text, text[-400:])
+check("it finds the proxy", "proxy-addr-123" in text)
+check("it confirms chunking is supported", "http chunking" in text and "supported" in text)
+check("it confirms the model can call tools", "can call tools" in text)
+check("it lists which .env keys are set, by name",
+      "PROXY_ADDRESS" in text and "OLLAMA_MODEL" in text, None)
+
+BROKEN_HTTP = """{
+  proxyAddress = function() return nil end,
+  get = function(url) return "" end,
+}"""
+
+text = run_doctor(
+    hw={"a1": "modem", "a2": "gpu"},
+    fakehttp=BROKEN_HTTP,
+    files={},
+    envvars={"PATH": "/bin:/usr/bin:."})
+check("a broken machine reports problems", "problem" in text, text[-300:])
+check("an old http.lua without chunking is caught", "NOT supported" in text, None)
+check("and the fix names the updater", "Run: update" in text, None)
+check("a proxy that cannot be found is caught", "not found" in text, None)
+check("an empty Ollama reply names the blacklist",
+      "blacklist" in text and "opencomputers.cfg" in text, None)
+check("a PATH without /home/bin is caught", "/home/bin" in text, None)
+check("a missing .env is caught", "not present" in text, None)
+check("it reaches a verdict rather than crashing partway",
+      "problem" in text or "warning" in text, text[-200:])
+
+TOOLLESS_HTTP = """{
+  chunked = true,
+  setTimeout = function() end,
+  proxyAddress = function() return "p" end,
+  get = function(url)
+    return '{"models":[{"name":"qwen2.5-coder:7b","capabilities":["completion"]},' ..
+           '{"name":"llama3.2:latest","capabilities":["completion","tools"]}]}'
+  end,
+}"""
+
+text = run_doctor(
+    hw={"a1": "modem"},
+    fakehttp=TOOLLESS_HTTP,
+    files={"/home/.env": "OLLAMA_MODEL=qwen2.5-coder:7b" + chr(10),
+           "/home/.update_state": "{}"},
+    envvars={"PATH": "/home/bin"})
+check("a model that cannot call tools is caught", "cannot call tools" in text, None)
+check("and one that can is offered instead", "llama3.2:latest" in text, None)
+
+# A machine with an Internet Card is the proxy, and must not be told to find one.
+text = run_doctor(
+    hw={"a1": "modem", "a2": "internet"},
+    fakehttp=HEALTHY_HTTP,
+    files={"/home/.update_state": "{}"},
+    envvars={"PATH": "/home/bin"})
+check("the proxy machine is recognised as such",
+      "this is the proxy machine" in text, None)
+check("and is not told to go looking for a proxy",
+      "this machine IS the proxy" in text, None)
+
 print()
 if failures:
     print("%d FAILURES: %s" % (len(failures), ", ".join(failures)))
