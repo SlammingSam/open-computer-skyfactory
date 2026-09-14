@@ -126,11 +126,27 @@ line now also reports the body size, so this failure is visible at the proxy:
 [proxy]   -> 200 OK, 0 bytes  (status not reported by the card - assumed)
 ```
 
-If it still fails after updating, in order:
+**If the proxy still logs `0 bytes` after updating**, that race was not your
+cause. Run `nettest.lua` **on the proxy computer**:
 
-1. `curl http://127.0.0.1:11434/api/tags` **on the machine hosting the
-   Minecraft server** — not your desktop, if those are different boxes.
-2. The `opencomputers.cfg` blacklist above.
+```
+nettest
+```
+
+It talks to the Internet Card directly — no modem, no proxy protocol, no JSON
+in the way — and reports what every call returns for a local address, a remote
+plain-HTTP address and a remote HTTPS one, then tries the same host over raw
+TCP. The contrast between those is the diagnosis:
+
+| What you see | What it means |
+|---|---|
+| `request() RAISED` | The card refused outright — almost always the blacklist |
+| `finishConnect -> nil, <reason>` | The connection genuinely failed, and the reason is printed |
+| Connects, then `0 bytes` and no status | The request is being blocked silently |
+| GitHub works, `127.0.0.1` does not | The card is refusing local addresses |
+| Raw TCP works where HTTP does not | Only the card's HTTP path is blocked — the proxy can speak HTTP over a socket instead |
+
+Results are also written to `/home/nettest.txt`.
 
 `/diag` inside the app probes the connection and reports the status, body
 length and first bytes of what actually came back, instead of trying to
