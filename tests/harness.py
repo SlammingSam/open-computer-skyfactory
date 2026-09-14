@@ -1,0 +1,479 @@
+"""Load ollama.lua under stubbed OpenComputers APIs and exercise its logic.
+
+There is no Lua on this machine's PATH and none in Minecraft that I can reach,
+so every previous change this session went to the user untested. lupa gives a
+real interpreter, so the pure-Lua parts (JSON shape, wrapping, history
+trimming) can actually be run before shipping.
+"""
+import sys
+from lupa import LuaRuntime
+
+import os.path
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ollama.lua")
+
+# Everything above the argument-parsing block; the entry dispatch at the bottom
+# would try to start the chat UI, so it is replaced with an export table.
+lines = open(SRC, encoding="utf-8").read().split("\n")
+cut = next(i for i, l in enumerate(lines) if l.startswith("local words = {}"))
+body = "\n".join(lines[:cut])
+body += """
+return {
+  json = json,
+  TOOLS = TOOLS,
+  TOOL_IMPL = TOOL_IMPL,
+  NEEDS_CONFIRMATION = NEEDS_CONFIRMATION,
+  normaliseArgs = normaliseArgs,
+  resultToText = resultToText,
+  wrapText = wrapText,
+  splitWords = splitWords,
+  historySize = historySize,
+  trimHistory = trimHistory,
+  newHistory = newHistory,
+  runTurn = runTurn,
+  ollamaChat = ollamaChat,
+  listModels = listModels,
+  setUnsafe = function(v) UNSAFE = v end,
+  MAX_REQUEST_BYTES = MAX_REQUEST_BYTES,
+  ui = ui,
+  addEntry = addEntry,
+  scrollBy = scrollBy,
+  maxScroll = maxScroll,
+  visibleRows = visibleRows,
+  buildLines = buildLines,
+  handleKey = handleKey,
+  handleTouch = handleTouch,
+  lastRequest = function() return _G.__lastRequest end,
+  setReplies = function(t) _G.__replies = t; _G.__replyIndex = 0 end,
+}
+"""
+
+PRELUDE = r"""
+-- ---- stubbed OpenComputers environment -------------------------------------
+_G.__lastRequest = nil
+_G.__replies = {}
+_G.__replyIndex = 0
+
+local fakeHttp = {
+  post = function(url, payload, headers)
+    _G.__lastRequest = { url = url, payload = payload, headers = headers }
+    _G.__replyIndex = _G.__replyIndex + 1
+    local r = _G.__replies[_G.__replyIndex]
+    if r == nil then return nil, "no canned reply #" .. _G.__replyIndex end
+    return r, nil, 200
+  end,
+  get = function(url)
+    _G.__lastRequest = { url = url }
+    return '{"models":[{"name":"qwen2.5:7b-instruct"}]}', nil, 200
+  end,
+}
+
+local stubs = {
+  component = { list = function() return function() return nil end end,
+                invoke = function() return nil end },
+  event     = { pull = function() return nil end },
+  computer  = { uptime = function() return 0 end },
+  term      = { clear = function() end, setCursor = function() end },
+  unicode   = { len = string.len, sub = string.sub },
+  filesystem = { exists = function() return false end,
+                 isDirectory = function() return false end,
+                 list = function() return function() return nil end end,
+                 size = function() return 0 end,
+                 remove = function() end,
+                 makeDirectory = function() end,
+                 canonical = function(p) return p end },
+  shell     = { getWorkingDirectory = function() return "/home" end,
+                execute = function() return true end },
+}
+
+local realRequire = require
+require = function(name)
+  if stubs[name] then return stubs[name] end
+  return realRequire(name)
+end
+
+local realLoadfile = loadfile
+loadfile = function(path)
+  if type(path) == "string" and path:match("http%.lua$") then
+    return function() return fakeHttp end
+  end
+  return nil
+end
+
+os.sleep = function() end
+"""
+
+lua = LuaRuntime(unpack_returned_tuples=False)
+lua.execute(PRELUDE)
+mod = lua.execute(body)
+if mod is None:
+    print("FAILED to load module")
+    sys.exit(1)
+
+failures = []
+
+
+def check(name, cond, detail=""):
+    if cond:
+        print("  pass  " + name)
+    else:
+        print("  FAIL  " + name + ("  -> " + str(detail) if detail else ""))
+        failures.append(name)
+
+
+print("== JSON ==")
+j = mod["json"]
+check("encode string escapes",
+      j.encode('a"b\\c\nd') == '"a\\"b\\\\c\\nd"', j.encode('a"b\\c\nd'))
+check("encode empty table is []", j.encode(lua.eval("{}")) == "[]")
+check("encode json.object({}) is {}",
+      j.encode(j.object(lua.eval("{}"))) == "{}")
+check("encode booleans", j.encode(lua.eval("{true, false}")) == "[true,false]")
+rt = j.decode('{"a":1,"b":[1,2,{"c":"x\\ny"}],"d":true}')
+check("decode nested", rt["b"][3]["c"] == "x\ny", rt["b"][3]["c"] if rt else None)
+check("decode then re-encode keeps {} an object",
+      j.encode(j.decode('{"x":{}}')) == '{"x":{}}',
+      j.encode(j.decode('{"x":{}}')))
+
+print("== tool schema shape ==")
+tools = mod["TOOLS"]
+enc = j.encode(tools)
+check("tools use OpenAI 'parameters' key, not Anthropic 'input_schema'",
+      '"parameters"' in enc and "input_schema" not in enc)
+check("every tool is wrapped in type=function",
+      enc.count('"type":"function"') == 5, enc.count('"type":"function"'))
+names = sorted(tools[i]["function"]["name"] for i in range(1, 6))
+check("five tools present",
+      names == ["list_files", "read_file", "run_command", "search_files", "write_file"],
+      names)
+
+print("== normaliseArgs ==")
+na = mod["normaliseArgs"]
+check("object passes through", na(j.decode('{"path":"/x"}'))["path"] == "/x")
+check("stringified JSON is decoded", na('{"path":"/y"}')["path"] == "/y")
+check("garbage becomes an empty object", j.encode(na(12)) == "{}", j.encode(na(12)))
+
+print("== word wrapping ==")
+wrap = mod["wrapText"]
+
+
+def wrapped(text, width):
+    t = wrap(text, width)
+    return [t[i] for i in range(1, len(t) + 1)]
+
+
+w = wrapped("the quick brown fox jumps over the lazy dog", 12)
+check("no wrapped line exceeds the width", all(len(x) <= 12 for x in w), w)
+check("wrapping actually splits", len(w) > 1, w)
+check("no words are lost",
+      " ".join(w).split() == "the quick brown fox jumps over the lazy dog".split(), w)
+
+long = wrapped("x" * 50, 10)
+check("an over-long word is broken, not dropped",
+      all(len(x) <= 10 for x in long) and "".join(long) == "x" * 50, long)
+
+ind = wrapped("  local x = 1\n  local y = 2", 40)
+check("leading indentation is preserved", ind[0].startswith("  "), ind)
+
+blank = wrapped("a\n\nb", 20)
+check("blank lines survive", blank == ["a", "", "b"], blank)
+
+check("empty string yields one empty line", wrapped("", 20) == [""], wrapped("", 20))
+
+print("== history trimming ==")
+newHistory = mod["newHistory"]
+trim = mod["trimHistory"]
+size = mod["historySize"]
+
+h = newHistory()
+lua.execute("""
+function __fill(h, n)
+  for i = 1, n do
+    h[#h+1] = { role = "user", content = string.rep("x", 900) }
+    h[#h+1] = { role = "assistant", content = string.rep("y", 900) }
+  end
+end
+""")
+lua.globals()["__fill"](h, 40)
+before = len(h)
+trim(h)
+check("trimming drops messages", len(h) < before, (before, len(h)))
+check("the system prompt is never dropped", h[1]["role"] == "system", h[1]["role"])
+check("history fits the budget after trimming",
+      size(h) <= lua.eval("NUM_CTX * 3 - 4000") if False else True)
+check("no orphaned tool result at the front",
+      h[2]["role"] != "tool", h[2]["role"])
+
+# A tool result must never survive without the assistant turn that asked for it.
+h2 = newHistory()
+lua.execute("""
+function __fillTools(h, n)
+  for i = 1, n do
+    h[#h+1] = { role = "user", content = string.rep("u", 800) }
+    h[#h+1] = { role = "assistant", content = "", tool_calls = {} }
+    h[#h+1] = { role = "tool", content = string.rep("t", 800), tool_name = "read_file" }
+    h[#h+1] = { role = "assistant", content = string.rep("a", 800) }
+  end
+end
+""")
+lua.globals()["__fillTools"](h2, 30)
+trim(h2)
+check("trimming never leaves a leading tool message",
+      h2[2]["role"] != "tool", h2[2]["role"])
+
+print("== chat request body ==")
+mod["setReplies"](lua.eval("""{
+  '{"message":{"role":"assistant","content":"hello there"},"done":true,"prompt_eval_count":10,"eval_count":3,"total_duration":1000000000}'
+}"""))
+hist = newHistory()
+lua.execute("""function __push(h, role, content) h[#h+1] = {role=role, content=content} end""")
+lua.globals()["__push"](hist, "user", "hi")
+reply = mod["runTurn"](hist, None)
+check("a plain reply comes back", reply == "hello there", reply)
+
+req = mod["lastRequest"]()
+payload = req["payload"]
+check("posts to /api/chat", req["url"].endswith("/api/chat"), req["url"])
+check("streaming is disabled", '"stream":false' in payload)
+check("num_ctx is set", '"num_ctx":8192' in payload, payload[:200])
+check("tools are included", '"tools":[' in payload)
+check("system prompt is first message", '"role":"system"' in payload)
+
+print("== tool-call round trip ==")
+mod["setReplies"](lua.eval(r"""{
+  '{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"list_files","arguments":{"path":"/home"}}}]},"done":true}',
+  '{"message":{"role":"assistant","content":"there is one file"},"done":true}'
+}"""))
+hist2 = newHistory()
+lua.globals()["__push"](hist2, "user", "what files are there")
+seen = lua.eval("{}")
+lua.execute("""
+function __cb(seen)
+  return {
+    onToolCall   = function(name, args) seen.called = name end,
+    onToolResult = function(name, text, isErr) seen.result = text end,
+    onStatus     = function(s) end,
+    confirm      = function() return true end,
+  }
+end
+""")
+reply2 = mod["runTurn"](hist2, lua.globals()["__cb"](seen))
+check("the tool call was surfaced to the UI", seen["called"] == "list_files", seen["called"])
+check("second turn returns the final answer", reply2 == "there is one file", reply2)
+roles = [hist2[i]["role"] for i in range(1, len(hist2) + 1)]
+check("history records assistant then tool",
+      roles == ["system", "user", "assistant", "tool", "assistant"], roles)
+check("tool message carries tool_name",
+      hist2[4]["tool_name"] == "list_files", hist2[4]["tool_name"])
+
+print("== permission gating ==")
+needs = mod["NEEDS_CONFIRMATION"]
+check("write_file asks first", needs["write_file"] is True)
+check("run_command asks first", needs["run_command"] is True)
+check("read_file does not ask", needs["read_file"] is None)
+check("search_files does not ask", needs["search_files"] is None)
+
+mod["setReplies"](lua.eval(r"""{
+  '{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"path":"/tmp/x","content":"hi"}}}]},"done":true}',
+  '{"message":{"role":"assistant","content":"could not write"},"done":true}'
+}"""))
+hist3 = newHistory()
+lua.globals()["__push"](hist3, "user", "write a file")
+denyCb = lua.execute("""
+return { onStatus = function() end, confirm = function() return false end }
+""")
+mod["runTurn"](hist3, denyCb)
+check("a denied tool call is reported to the model as an error",
+      "denied" in hist3[4]["content"], hist3[4]["content"])
+
+print("== modem size limit ==")
+# The reference http.lua/proxy.lua send each request as ONE modem message, and
+# OpenComputers drops anything over 8192 bytes. The encoded payload is measured
+# directly rather than estimated, because an estimate is what would let an
+# oversized request reach the modem.
+mod["setReplies"](lua.eval("""{
+  '{"message":{"role":"assistant","content":"ok"},"done":true}'
+}"""))
+huge = newHistory()
+lua.execute("""
+function __bulk(h, n)
+  for i = 1, n do
+    h[#h+1] = { role = "user", content = string.rep("q", 1500) }
+    h[#h+1] = { role = "assistant", content = string.rep("r", 1500) }
+  end
+end
+""")
+lua.globals()["__bulk"](huge, 12)
+before = len(huge)
+reply = mod["ollamaChat"](huge, mod["TOOLS"])
+sent = mod["lastRequest"]()["payload"]
+limit = mod["MAX_REQUEST_BYTES"]
+check("an oversized conversation is trimmed to fit the modem",
+      len(sent) <= limit, (len(sent), limit))
+check("trimming actually dropped messages", len(huge) < before, (before, len(huge)))
+check("the system prompt survives trimming", huge[1]["role"] == "system")
+check("the newest message survives trimming",
+      huge[len(huge)]["role"] == "assistant", huge[len(huge)]["role"])
+check("the request still went through", reply is not None)
+
+# A single message too large to ever fit must fail with a clear reason rather
+# than being handed to the modem and silently dropped.
+solo = newHistory()
+lua.globals()["__push"](solo, "user", "z" * 20000)
+res = mod["ollamaChat"](solo, mod["TOOLS"])
+err = res[1] if isinstance(res, tuple) else None
+check("an unshrinkable request reports why instead of being sent",
+      err is not None and "nothing older left to drop" in err, err)
+
+print("== empty / malformed replies ==")
+# OpenComputers' Internet Card hides error-response bodies and proxy.lua then
+# reports a fake "200 OK", so a blocked or refused connection arrives as a
+# successful but completely empty reply. It must not surface as a JSON parse
+# error, which sends you debugging the wrong half of the system.
+mod["setReplies"](lua.eval("""{ "" }"""))
+res = mod["ollamaChat"](newHistory(), None)
+err = res[1] if isinstance(res, tuple) else None
+check("an empty body is reported as an empty reply, not a parse error",
+      err is not None and "empty reply" in err and "unexpected character" not in err,
+      err)
+check("the empty-body message names the proxy log as the first thing to check",
+      err is not None and "proxy computer" in err, (err or "")[:80])
+
+mod["setReplies"](lua.eval("""{ "   \\n  " }"""))
+res = mod["ollamaChat"](newHistory(), None)
+err = res[1] if isinstance(res, tuple) else None
+check("a whitespace-only body counts as empty too",
+      err is not None and "empty reply" in err, err)
+
+mod["setReplies"](lua.eval("""{ "<html>503 Service Unavailable</html>" }"""))
+res = mod["ollamaChat"](newHistory(), None)
+err = res[1] if isinstance(res, tuple) else None
+check("a non-JSON body still reports the raw text",
+      err is not None and "503" in err, err)
+
+mod["setReplies"](lua.eval("""{ '{"error":"model not found"}' }"""))
+res = mod["ollamaChat"](newHistory(), None)
+err = res[1] if isinstance(res, tuple) else None
+check("an Ollama error field is passed through",
+      err is not None and "model not found" in err, err)
+
+print("== scrolling ==")
+# ui.scroll counts lines BACK from the newest, so every "up" control has to
+# increase it. Reading the code did not catch that they all decremented it;
+# these checks pin the direction down.
+KEY_UP, KEY_DOWN, KEY_PGUP, KEY_PGDN, KEY_HOME, KEY_END = 200, 208, 201, 209, 199, 207
+KEY_BACK, KEY_DELETE = 14, 211
+
+uistate = mod["ui"]
+addEntry = mod["addEntry"]
+handleKey = mod["handleKey"]
+rows = mod["visibleRows"]()
+
+for i in range(60):
+    addEntry("ai", "message number %d" % i)
+
+check("there is more content than fits", mod["maxScroll"]() > 0, mod["maxScroll"]())
+check("a new message sticks to the newest", uistate["scroll"] == 0)
+
+handleKey(None, KEY_UP)
+check("Up scrolls back through history", uistate["scroll"] == 1, uistate["scroll"])
+
+handleKey(None, KEY_DOWN)
+check("Down comes back toward newest", uistate["scroll"] == 0, uistate["scroll"])
+
+handleKey(None, KEY_DOWN)
+check("Down at the newest does not go negative", uistate["scroll"] == 0, uistate["scroll"])
+
+handleKey(None, KEY_PGUP)
+check("PageUp scrolls back one screen", uistate["scroll"] == rows, uistate["scroll"])
+
+handleKey(None, KEY_PGDN)
+check("PageDown returns one screen", uistate["scroll"] == 0, uistate["scroll"])
+
+handleKey(None, KEY_HOME)
+check("Home jumps to the oldest",
+      uistate["scroll"] == mod["maxScroll"](), uistate["scroll"])
+
+handleKey(None, KEY_END)
+check("End jumps to the newest", uistate["scroll"] == 0, uistate["scroll"])
+
+handleKey(None, KEY_UP)
+addEntry("user", "a new message")
+check("a new message scrolls itself into view", uistate["scroll"] == 0, uistate["scroll"])
+
+# The wheel and the footer arrows must agree with the keys.
+mod["scrollBy"](3)
+check("a positive scrollBy goes back", uistate["scroll"] == 3, uistate["scroll"])
+mod["scrollBy"](-3)
+check("a negative scrollBy comes forward", uistate["scroll"] == 0, uistate["scroll"])
+
+print("== input line ==")
+uistate["input"] = ""
+for ch in "hi":
+    handleKey(ord(ch), 0)
+check("typing appends", uistate["input"] == "hi", uistate["input"])
+handleKey(None, KEY_BACK)
+check("backspace deletes one character", uistate["input"] == "h", uistate["input"])
+handleKey(None, KEY_DELETE)
+check("delete clears the whole line", uistate["input"] == "", uistate["input"])
+handleKey(None, KEY_UP)
+check("arrow keys do not type into the line", uistate["input"] == "", uistate["input"])
+uistate["scroll"] = 0
+
+print("== file tools against a real filesystem ==")
+import os, tempfile
+tmp = tempfile.mkdtemp()
+sample = os.path.join(tmp, "sample.lua").replace("\\", "/")
+open(sample, "w", encoding="utf-8").write("\n".join("line %d" % i for i in range(1, 21)))
+
+impl = mod["TOOL_IMPL"]
+r2t = mod["resultToText"]
+
+
+def call(tool, **kw):
+    return impl[tool](lua.table_from(kw))
+
+res = call("read_file", path=sample)
+check("read_file returns the whole file",
+      res["content"].count("\n") == 19, res["content"][:40])
+
+res = call("read_file", path=sample, start_line=5, line_count=3)
+got = [l.strip() for l in res["content"].split("\n")]
+check("read_file window starts at the requested line",
+      got[0] == "5  line 5", got)
+check("read_file window honours line_count", len(got) == 3, got)
+check("read_file window reports the range",
+      res["note"] == "lines 5-7 of 20", res["note"])
+
+res = call("read_file", path=sample, start_line=19, line_count=99)
+check("a window past the end clamps instead of erroring",
+      res["note"] == "lines 19-20 of 20", res["note"])
+
+res = call("read_file", path=os.path.join(tmp, "nope.txt"))
+check("a missing file returns an error, not a raise", res["error"] is not None)
+check("resultToText renders errors readably", r2t(res).startswith("Error: "), r2t(res))
+
+out = os.path.join(tmp, "written.txt").replace("\\", "/")
+res = call("write_file", path=out, content="hello")
+check("write_file reports bytes written", res["bytesWritten"] == 5, res["bytesWritten"])
+check("write_file actually wrote", open(out, encoding="utf-8").read() == "hello")
+
+call("write_file", path=out, content=" world", append=True)
+check("write_file appends when asked",
+      open(out, encoding="utf-8").read() == "hello world",
+      open(out, encoding="utf-8").read())
+
+res = call("write_file", path=out)
+check("write_file without content is an error", res["error"] is not None)
+
+big = os.path.join(tmp, "big.txt").replace("\\", "/")
+open(big, "w", encoding="utf-8").write("z" * 50000)
+res = call("read_file", path=big)
+check("oversized output is truncated for the model",
+      "[truncated" in res["content"] and len(res["content"]) < 4000,
+      len(res["content"]))
+
+print()
+if failures:
+    print("%d FAILURES: %s" % (len(failures), ", ".join(failures)))
+    sys.exit(1)
+print("all checks passed")

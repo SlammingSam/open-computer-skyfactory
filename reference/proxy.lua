@@ -11,21 +11,6 @@
 -- "net_msg" event, and "text" has no serialize/unserialize (that lives in
 -- "serialization"). We alias those here so the rest of the code reads the
 -- way the spec describes, while still using real OC APIs underneath.
---
--- CHANGES FROM THE ORIGINAL (2026-09-14)
--- internet.request() is ASYNCHRONOUS: it returns a handle before the
--- connection has been established. The original read the handle immediately,
--- and OpenComputers returns nil from read() on a request that is not ready
--- yet -- which the read loop could not tell apart from end-of-stream. The
--- result was a successful-looking request with a completely empty body, and
--- because handle.response() also had nothing to say, the status defaulted to
--- "200 OK". Remote HTTPS hosts happened to win that race; a local Ollama on
--- 127.0.0.1 lost it every time.
---
--- Fixed by waiting on finishConnect() before reading, and by treating an
--- empty-string read as "nothing yet" rather than as the end. The log line now
--- also reports the body size, so an empty body is visible here rather than
--- only showing up as a parse error on the client.
 
 local component     = require("component")
 local event          = require("event")
@@ -34,11 +19,6 @@ local text           = serialization -- alias: text.serialize / text.unserialize
 
 -- ==== CONFIG ====================================================
 local PORT = 123 -- network port all proxy traffic uses
-
--- How long to wait for a connection to be established, and how long to wait
--- for more data once connected, before giving up. Both in seconds.
-local CONNECT_TIMEOUT = 15
-local READ_TIMEOUT    = 30
 
 -- Allowlist of permitted client (modem) addresses.
 -- Add entries like this (get the address by running `address` on the
@@ -76,27 +56,6 @@ local function isAllowed(address)
     return ALLOWLIST[address] == true
 end
 
--- Blocks until the request has actually connected.
--- finishConnect() returns true when connected, false while still working, and
--- nil + message on failure. Skipping this is what produced empty bodies.
-local function waitForConnection(handle)
-    if type(handle.finishConnect) ~= "function" then
-        return -- older card without the call; nothing we can do but try
-    end
-    local deadline = os.clock() + CONNECT_TIMEOUT
-    while true do
-        local ok, err = handle.finishConnect()
-        if ok then return end
-        if ok == nil then
-            error("could not connect: " .. tostring(err or "unknown error"))
-        end
-        if os.clock() > deadline then
-            error("timed out connecting after " .. CONNECT_TIMEOUT .. "s")
-        end
-        os.sleep(0.05)
-    end
-end
-
 -- Performs the actual HTTP request via the Internet Card and returns a
 -- response table { status, statusText, headers, body }.
 -- Raises a Lua error (caller should pcall this) on any failure.
@@ -118,18 +77,9 @@ local function doHttpRequest(method, url, headers, body)
         error("failed to open connection to " .. url)
     end
 
-    local okConnect, connectErr = pcall(waitForConnection, handle)
-    if not okConnect then
-        pcall(function() handle.close() end)
-        error(connectErr)
-    end
-
-    -- Read the full response body. read() returns a string (possibly EMPTY,
-    -- meaning "connected but nothing buffered yet") while the response is
-    -- still arriving, and nil only at genuine end of stream. Treating "" as
-    -- the end is what truncated fast local responses to nothing.
+    -- Read the full response body, chunk by chunk. Errors thrown while
+    -- reading (e.g. connection reset, DNS failure) surface here.
     local chunks = {}
-    local deadline = os.clock() + READ_TIMEOUT
     while true do
         local ok, chunk = pcall(function() return handle.read(8192) end)
         if not ok then
@@ -138,30 +88,19 @@ local function doHttpRequest(method, url, headers, body)
         end
         if chunk == nil then
             break -- end of stream
-        elseif chunk == "" then
-            if os.clock() > deadline then
-                pcall(function() handle.close() end)
-                error("timed out reading after " .. READ_TIMEOUT .. "s")
-            end
-            os.sleep(0.05) -- nothing buffered yet; yield and come back
-        else
-            chunks[#chunks + 1] = chunk
-            deadline = os.clock() + READ_TIMEOUT -- progress resets the clock
-            os.sleep(0) -- keep the watchdog happy on large bodies
         end
+        chunks[#chunks + 1] = chunk
     end
 
     -- Pull status code / headers if the internet card exposes them
     -- (available on modern OpenComputers internet card implementations).
     local status, statusText, respHeaders = 200, "OK", {}
-    local statusKnown = false
     if handle.response then
         local ok, code, msg, hdrs = pcall(handle.response)
         if ok and code then
             status = code
             statusText = msg or ""
             respHeaders = hdrs or {}
-            statusKnown = true
         end
     end
 
@@ -170,31 +109,14 @@ local function doHttpRequest(method, url, headers, body)
     return {
         status = status,
         statusText = statusText,
-        statusKnown = statusKnown, -- false means the 200 above is a guess
         headers = respHeaders,
         body = table.concat(chunks),
     }
 end
 
 -- Sends a serialized message back to a client.
--- An OpenComputers modem drops any message over 8192 bytes, so a body that
--- serializes past that never arrives and the client just times out. Say so
--- here instead, where it is visible.
-local MAX_MESSAGE = 8192
-
 local function sendTo(address, msgType, payload)
-    local serialized = text.serialize(payload)
-    if #serialized > MAX_MESSAGE then
-        print(string.format("[proxy]   !! reply is %d bytes, over the %d-byte modem limit",
-                            #serialized, MAX_MESSAGE))
-        serialized = text.serialize({
-            id = payload.id,
-            error = string.format(
-                "response was %d bytes, over the %d-byte limit one modem message can carry",
-                #serialized, MAX_MESSAGE),
-        })
-    end
-    local ok, err = pcall(network.send, address, PORT, msgType, serialized)
+    local ok, err = pcall(network.send, address, PORT, msgType, text.serialize(payload))
     if not ok then
         print("[proxy] ERROR sending reply to " .. tostring(address) .. ": " .. tostring(err))
     end
@@ -232,14 +154,7 @@ while true do
                 if okReq then
                     result.id = req.id
                     sendTo(remoteAddr, "response", result)
-                    -- Body size is the useful half of this line: an empty body
-                    -- with a "200 OK" is the signature of a request that never
-                    -- really happened, and it used to be invisible from here.
-                    print(string.format("[proxy]   -> %s %s, %d bytes%s",
-                        tostring(result.status),
-                        tostring(result.statusText),
-                        #result.body,
-                        result.statusKnown and "" or "  (status not reported by the card - assumed)"))
+                    print("[proxy]   -> " .. tostring(result.status) .. " " .. tostring(result.statusText))
                 else
                     print("[proxy]   -> ERROR: " .. tostring(result))
                     sendTo(remoteAddr, "response", { id = req.id, error = tostring(result) })
