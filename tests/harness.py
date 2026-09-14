@@ -37,6 +37,8 @@ return {
   MAX_REQUEST_BYTES = MAX_REQUEST_BYTES,
   HISTORY_CHAR_BUDGET = HISTORY_CHAR_BUDGET,
   taskIndex = taskIndex,
+  systemPrompt = systemPrompt,
+  describeModule = describeModule,
   setMaxSteps = function(n) MAX_TOOL_ITERATIONS = n end,
   ui = ui,
   addEntry = addEntry,
@@ -57,6 +59,7 @@ _G.__lastRequest = nil
 _G.__replies = {}
 _G.__replyIndex = 0
 _G.__fsfiles = {}
+_G.__components = { ["a1"] = "gpu", ["a2"] = "modem", ["a3"] = "screen" }
 
 local fakeHttp = {
   post = function(url, payload, headers)
@@ -70,13 +73,30 @@ local fakeHttp = {
     _G.__lastRequest = { url = url }
     return '{"models":[{"name":"qwen2.5:7b-instruct"}]}', nil, 200
   end,
+  setTimeout = function() end,
+  getTimeout = function() return 90 end,
+  proxyAddress = function() return "fake-proxy" end,
+  forgetProxy = function() end,
 }
 
 local stubs = {
-  component = { list = function() return function() return nil end end,
-                invoke = function() return nil end },
+  component = {
+    list = function(filter)
+      local rows = {}
+      for addr, ctype in pairs(_G.__components) do
+        if not filter or ctype == filter then rows[#rows + 1] = { addr, ctype } end
+      end
+      local i = 0
+      return function()
+        i = i + 1
+        if rows[i] then return rows[i][1], rows[i][2] end
+      end
+    end,
+    invoke = function() return nil end },
   event     = { pull = function() return nil end },
-  computer  = { uptime = function() return 0 end },
+  computer  = { uptime = function() return 0 end,
+                totalMemory = function() return 4194304 end,
+                freeMemory = function() return 1310720 end },
   term      = { clear = function() end, setCursor = function() end },
   unicode   = { len = string.len, sub = string.sub },
   filesystem = { exists = function(p) return _G.__fsfiles[p] ~= nil end,
@@ -521,6 +541,51 @@ check("the history budget then follows the context window",
       mod_c["HISTORY_CHAR_BUDGET"] > 15000, mod_c["HISTORY_CHAR_BUDGET"])
 check("an un-chunked transport keeps the old ceiling",
       mod["MAX_REQUEST_BYTES"] == 7600, mod["MAX_REQUEST_BYTES"])
+
+print("== the system prompt teaches the platform ==")
+# The model invented http.findProxy() because nothing told it what this machine
+# actually has. The brief is built from the live machine, not assumed.
+sp = mod_c["systemPrompt"]()
+
+check("the OpenComputers brief is there", "OpenOS on OpenComputers" in sp)
+check("it says io.popen does not exist", "io.popen DO NOT EXIST" in sp, None)
+check("it says run_command is a shell, not a Lua prompt",
+      "not a Lua prompt" in sp, None)
+check("it warns about the yield watchdog", "too long without yielding" in sp, None)
+check("it warns that filesystem does not resolve relative paths",
+      "does NOT resolve relative paths" in sp, None)
+check("it states the modem message limit", "8192" in sp, None)
+check("it says there is no grep", "no grep" in sp, None)
+
+check("it lists the real http functions", "proxyAddress" in sp, None)
+check("it lists the real json functions", "decode" in sp, None)
+check("it does not contain the function the model invented",
+      "findProxy" not in sp, None)
+
+check("it reports the components actually attached",
+      "modem" in sp and "gpu" in sp, None)
+check("it reports memory read off the machine", "4096 KB total" in sp, None)
+check("it notes there is no Internet Card on this machine",
+      "No Internet Card here" in sp, None)
+check("the working directory is stated", "/home" in sp, None)
+
+check("newHistory sends exactly this", mod_c["newHistory"]()[1]["content"] == sp)
+check("it is cached rather than rebuilt", mod_c["systemPrompt"]() is sp or
+      mod_c["systemPrompt"]() == sp)
+
+# Module introspection is what keeps the function list honest.
+desc = mod_c["describeModule"]("json", mod_c["json"])
+check("describeModule lists functions from the real table",
+      "encode" in desc and "decode" in desc, desc)
+check("describeModule ignores a non-table", mod_c["describeModule"]("x", 5) is None)
+
+# A small budget cannot afford the brief, and silently spending it there would
+# leave no room for the job itself.
+small = mod["systemPrompt"]()
+check("a cramped budget drops the brief instead of crowding out the task",
+      "OpenOS on OpenComputers" not in small, len(small))
+check("the core instructions survive either way",
+      "terminal assistant" in small and "terminal assistant" in sp)
 
 print("== file tools against a real filesystem ==")
 import os, tempfile

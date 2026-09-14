@@ -268,12 +268,52 @@ to scroll, and tap any footer button. Pasting into the terminal works too.
 | `/host <url>` | Point at a different Ollama instance |
 | `/tools` | List the tools the model can call |
 | `/diag` | Probe the connection and report exactly what came back |
+| `/prompt` | Show the system prompt the model is given, and its token cost |
 | `/unsafe` | Toggle skipping permission prompts |
 | `/save <path>` | Write the conversation to a file |
 | `/help` | Command list |
 | `/exit` | Quit |
 
 ---
+
+## What the model is told about the machine
+
+A 7B model does not know OpenComputers. Left to itself it writes code for a
+normal Unix box — `io.popen`, `os.execute`, `grep` — and invents plausible
+library functions. In testing it called `http.findProxy()`, which does not
+exist; the real call is `http.proxyAddress()`.
+
+So the system prompt carries a brief covering what this platform actually is:
+no `io.popen` or `os.execute`, `os.sleep(0)` to satisfy the yield watchdog,
+`filesystem.*` not resolving relative paths while `io.open` does, `event.pull`
+discarding unmatched events, the 8192-byte modem limit, and a shell with no
+`grep`, `find`, `curl` or `python`.
+
+The second half is read off the machine at startup rather than assumed:
+
+```
+THIS COMPUTER RIGHT NOW
+- Memory: 4096 KB total, 1280 KB free
+- Components attached: filesystem x2, gpu, keyboard, modem, screen
+- No Internet Card here. Network access goes through the proxy computer.
+- Working directory: /home
+- Libraries available here, and the functions they actually have:
+    http: forgetProxy, get, getTimeout, post, proxyAddress, setTimeout
+    json: decode, encode, object
+    env: bool, get, load, number, present, reload, set
+```
+
+That last part is the one that earns its keep — the model is given the real
+function names instead of guessing them, and told to `read_file` anything else
+before using it.
+
+`/prompt` shows the whole thing and what it costs per request. `OLLAMA_OC_BRIEF`
+in `.env` forces it on or off; by default it is included when the context window
+has room and skipped when it does not, since on a cramped budget the brief would
+crowd out the job itself.
+
+Anything in `/home/.ollama_prompt` is appended, for standing instructions you
+want on every conversation.
 
 ## Tools the model can call
 

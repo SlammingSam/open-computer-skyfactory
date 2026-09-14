@@ -1013,8 +1013,154 @@ local function runTurn(history, cb)
               "or raise OLLAMA_MAX_STEPS in /home/.env."
 end
 
+-- What the model needs in order to write Lua that actually runs here, and to
+-- stop reaching for things this platform does not have. A long string so the
+-- text stays readable and needs no escaping. Sent with every request, so it is
+-- kept factual and terse rather than discursive.
+local OC_BRIEF = [[
+
+THE MACHINE YOU ARE ON
+OpenOS on OpenComputers, Lua 5.3, inside Minecraft. It is not a Unix box, and
+most things you would reach for on one are absent.
+
+Lua:
+- The standard library only. No LuaSocket, no LuaFileSystem, no luarocks.
+- os.execute and io.popen DO NOT EXIST. Use run_command for shell work.
+- os.sleep(seconds) exists and is how a program yields.
+- Memory is a few megabytes in total. Building a table with one entry per byte
+  of a file will run the machine out of memory; work with strings instead.
+- A loop that runs too long without yielding is killed outright ("too long
+  without yielding"). Call os.sleep(0) inside any long loop.
+
+OpenComputers APIs, through require:
+  component, computer, event, term, filesystem, shell, unicode, serialization,
+  keyboard. The internet API exists only on a machine with an Internet Card.
+- Hardware is reached through component: component.list(type) enumerates it,
+  component.invoke(address, method, ...) calls it. component.gpu and
+  component.modem are shortcuts to the primary of each type.
+- Events are pulled, not delivered to callbacks: event.pull(timeout, name).
+  event.pull DISCARDS events that do not match its filter, so anything that
+  must not miss a message uses event.listen instead.
+- filesystem.* does NOT resolve relative paths, but io.open does. Make a path
+  absolute before handing it to a filesystem function.
+- A modem message cannot exceed 8192 bytes.
+
+The shell, which is what run_command runs:
+- ls, cd, cp, mv, rm, mkdir, cat, edit, df, components, reboot, shutdown.
+- There is no grep, find, sed, awk, curl, git or python. Use search_files
+  rather than grep, and the file tools rather than cat and rm.
+- > and >> redirect output. It is a shell, not a Lua prompt: a Lua expression
+  is taken as the name of a program to run, and fails.
+- Programs are .lua files. On PATH they run by name, without the extension.
+]]
+
+-- The functions a module really has, so the model uses those instead of
+-- inventing plausible ones. Guessing an API is the single most common way its
+-- generated code fails here.
+local function describeModule(name, mod)
+  if type(mod) ~= "table" then return nil end
+  local fns = {}
+  for k, v in pairs(mod) do
+    if type(v) == "function" then fns[#fns + 1] = k end
+  end
+  if #fns == 0 then return nil end
+  table.sort(fns)
+  return "  " .. name .. ": " .. table.concat(fns, ", ")
+end
+
+-- Facts read off this machine at startup, rather than assumed. A second
+-- computer with different hardware gets a different, correct brief.
+local function machineFacts()
+  local lines = {}
+
+  local okMem, total = pcall(function() return computer.totalMemory() end)
+  local _, free = pcall(function() return computer.freeMemory() end)
+  if okMem and tonumber(total) then
+    lines[#lines + 1] = string.format("- Memory: %d KB total, %d KB free",
+                                      math.floor(total / 1024),
+                                      math.floor((tonumber(free) or 0) / 1024))
+  end
+
+  local counts = {}
+  pcall(function()
+    for _, ctype in component.list() do
+      counts[ctype] = (counts[ctype] or 0) + 1
+    end
+  end)
+  local names = {}
+  for ctype, n in pairs(counts) do
+    names[#names + 1] = (n > 1) and (ctype .. " x" .. n) or ctype
+  end
+  if #names > 0 then
+    table.sort(names)
+    lines[#lines + 1] = "- Components attached: " .. table.concat(names, ", ")
+    if not counts.internet then
+      lines[#lines + 1] = "- No Internet Card here. Network access goes through " ..
+                          "the proxy computer via the http library below."
+    end
+  end
+
+  if shell and shell.getWorkingDirectory then
+    local cwd = shell.getWorkingDirectory()
+    if cwd then lines[#lines + 1] = "- Working directory: " .. cwd end
+  end
+
+  local described = {}
+  for _, pair in ipairs({ { "http", http }, { "json", json }, { "env", env } }) do
+    local d = describeModule(pair[1], pair[2])
+    if d then described[#described + 1] = d end
+  end
+  if #described > 0 then
+    lines[#lines + 1] = "- Libraries available here, and the functions they" ..
+                        " actually have (use these exact names):"
+    for _, d in ipairs(described) do lines[#lines + 1] = d end
+    lines[#lines + 1] = "  Anything else: read the file with read_file first" ..
+                        " rather than guessing what it provides."
+  end
+
+  if #lines == 0 then return "" end
+  return "\nTHIS COMPUTER RIGHT NOW\n" .. table.concat(lines, "\n") .. "\n"
+end
+
+local systemPromptCache = nil
+
+local function systemPrompt()
+  if systemPromptCache then return systemPromptCache end
+
+  local parts = { SYSTEM_PROMPT }
+
+  -- The brief costs a few hundred tokens of every request, which is cheap
+  -- against a normal context window and ruinous against a small one: on a
+  -- transport that cannot chunk, the whole conversation budget is about 5,000
+  -- characters and the brief would leave no room for the actual job. So it is
+  -- included when there is room, and OLLAMA_OC_BRIEF in /home/.env overrides
+  -- the decision either way.
+  local wanted = env and env.bool("OLLAMA_OC_BRIEF", nil) or nil
+  local roomy = HISTORY_CHAR_BUDGET >= 12000
+  if wanted == true or (wanted == nil and roomy) then
+    parts[#parts + 1] = OC_BRIEF
+    parts[#parts + 1] = machineFacts()
+  end
+
+  -- Standing instructions the user wants on every conversation, without
+  -- editing this file or losing them on the next update.
+  local extraPath = (env and env.get("OLLAMA_PROMPT_FILE", "/home/.ollama_prompt"))
+                    or "/home/.ollama_prompt"
+  local f = io.open(extraPath, "r")
+  if f then
+    local extra = f:read("*a")
+    f:close()
+    if extra and extra:match("%S") then
+      parts[#parts + 1] = "\nSTANDING INSTRUCTIONS FOR THIS MACHINE\n" .. extra
+    end
+  end
+
+  systemPromptCache = table.concat(parts, "\n")
+  return systemPromptCache
+end
+
 local function newHistory()
-  return { { role = "system", content = SYSTEM_PROMPT } }
+  return { { role = "system", content = systemPrompt() } }
 end
 
 -- ================================== screen ==================================
@@ -1540,6 +1686,7 @@ local HELP_TEXT =
   "  /host <url>      point at a different Ollama instance\n" ..
   "  /tools           list the tools the model can call\n" ..
   "  /diag            probe the connection and report exactly what came back\n" ..
+  "  /prompt          show the system prompt the model is given\n" ..
   "  /unsafe          toggle skipping permission prompts\n" ..
   "  /save <path>     write this conversation to a file\n" ..
   "  /help            this list\n" ..
@@ -1606,6 +1753,12 @@ local function runCommand(line)
         "\n      " .. f.description
     end
     addEntry("info", "Tools available to the model:\n" .. table.concat(names, "\n"))
+
+  elseif cmd == "/prompt" then
+    local text = systemPrompt()
+    addEntry("info", text)
+    setStatus(string.format("system prompt: %d characters, roughly %d tokens of " ..
+                            "every request", #text, math.floor(#text / 3.6)), "info")
 
   elseif cmd == "/diag" then
     addEntry("info", "Probing " .. OLLAMA_HOST .. " through " .. tostring(httpPath) ..
